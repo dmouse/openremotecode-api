@@ -1,0 +1,7 @@
+.air-tmp/
+Dockerfile*
+.dockerignore
+.git/
+.claude/
+docs/
+*.md
