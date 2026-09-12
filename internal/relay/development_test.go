@@ -44,6 +44,18 @@ func TestDevelopmentRelayRoutesOpaqueEnvelopes(t *testing.T) {
 		t.Fatalf("expected connector %q, got %q", connectorKeyID, presence.Identity.KeyID)
 	}
 
+	_, connectorPresenceMessage, err := connector.ReadMessage()
+	if err != nil {
+		t.Fatalf("read client presence on connector: %v", err)
+	}
+	var connectorPresence helloMessage
+	if err := json.Unmarshal(connectorPresenceMessage, &connectorPresence); err != nil {
+		t.Fatalf("decode client presence on connector: %v", err)
+	}
+	if connectorPresence.Identity.KeyID != clientKeyID {
+		t.Fatalf("expected client %q presence on connector, got %q", clientKeyID, connectorPresence.Identity.KeyID)
+	}
+
 	request := testEnvelope(clientKeyID, connectorKeyID)
 	requestBytes, err := json.Marshal(request)
 	if err != nil {
@@ -199,6 +211,9 @@ func TestDevelopmentRelayRejectsSenderSpoofing(t *testing.T) {
 	if _, _, err := client.ReadMessage(); err != nil {
 		t.Fatalf("read connector presence: %v", err)
 	}
+	if _, _, err := connector.ReadMessage(); err != nil {
+		t.Fatalf("read client presence on connector: %v", err)
+	}
 
 	spoofed := testEnvelope(strings.Repeat("s", 43), connectorKeyID)
 	if err := client.WriteJSON(spoofed); err != nil {
@@ -208,9 +223,27 @@ func TestDevelopmentRelayRejectsSenderSpoofing(t *testing.T) {
 	if _, _, err := client.ReadMessage(); err == nil {
 		t.Fatal("expected spoofing client connection to close")
 	}
+	// Closing the spoofing client's connection legitimately fans out a
+	// client.offline notification to the connector; drain that before
+	// asserting nothing else (in particular, the spoofed envelope) follows it.
+	_ = connector.SetReadDeadline(time.Now().Add(time.Second))
+	_, offlineMessage, err := connector.ReadMessage()
+	if err != nil {
+		t.Fatalf("read client offline on connector: %v", err)
+	}
+	var offline struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(offlineMessage, &offline); err != nil {
+		t.Fatalf("decode client offline: %v", err)
+	}
+	if offline.Type != "client.offline" {
+		t.Fatalf("spoofed request reached connector: %#v", offline)
+	}
+
 	_ = connector.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	if _, _, err := connector.ReadMessage(); err == nil {
-		t.Fatal("spoofed request reached connector")
+		t.Fatal("unexpected extra message reached connector")
 	}
 }
 
