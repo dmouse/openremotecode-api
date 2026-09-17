@@ -209,6 +209,16 @@ This is **not** an authentication or authorization control and must never be tre
 
 Readiness returns a generic failure response and does not expose dependency details.
 
+## Relay Protocol Version
+
+Both relay endpoints speak relay protocol version 2 and reject other versions explicitly.
+Version 2 added the per-connection `nonce` on each hello and the `epoch` on each envelope,
+which together stop an envelope captured in one connection from being replayed into
+another. The relay forwards nonces unchanged and validates only the shape of both fields;
+peers enforce freshness. Connector and device identities are versioned separately and stay
+at version 1, so a relay protocol revision never invalidates a stored identity or forces
+re-pairing. See [ADR 0011](docs/adr/0011-relay-connection-epochs.md).
+
 ## Development Only
 
 The Compose defaults use known local secrets and bind published ports to `127.0.0.1`. `/dev/relay` has no account authentication or pairing and exists only for the real-OpenCode test harness. It must not be exposed publicly or reused as production configuration.

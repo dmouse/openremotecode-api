@@ -370,8 +370,9 @@ func TestPersistentPairingAndSingleUseTickets(t *testing.T) {
 	}
 	defer socket.Close()
 	if err := socket.WriteJSON(map[string]any{
-		"protocolVersion": 1, "type": "connector.hello", "pluginVersion": "0.1.0",
-		"identity": connectorIdentity, "capabilities": []string{"session.list"},
+		"protocolVersion": 2, "type": "connector.hello", "pluginVersion": "0.1.0",
+		"identity": connectorIdentity, "nonce": strings.Repeat("n", 22),
+		"capabilities": []string{"session.list"},
 	}); err != nil {
 		t.Fatal(err)
 	}

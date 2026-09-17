@@ -15,7 +15,10 @@ import (
 )
 
 const (
-	protocolVersion       = 1
+	protocolVersion = 2
+	// Identities are versioned independently of the relay protocol; they persist
+	// across protocol revisions and must not be invalidated by one.
+	identityVersion       = 1
 	hpkeSuiteID           = "HPKE-Auth-P256-HKDF-SHA256-AES-256-GCM"
 	maxHelloLength        = 16 * 1024
 	maxRelayFrameLength   = 2_000_000
@@ -30,6 +33,7 @@ const (
 
 var (
 	keyIDPattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	noncePattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
 	base64URLPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 	uuidPattern      = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 )
@@ -124,6 +128,7 @@ type helloMessage struct {
 	Type            string         `json:"type"`
 	PluginVersion   string         `json:"pluginVersion,omitempty"`
 	Identity        publicIdentity `json:"identity"`
+	Nonce           string         `json:"nonce"`
 	Capabilities    []string       `json:"capabilities,omitempty"`
 }
 
@@ -133,6 +138,7 @@ type relayEnvelope struct {
 	MessageID       string `json:"messageId"`
 	SenderKeyID     string `json:"senderKeyId"`
 	RecipientKeyID  string `json:"recipientKeyId"`
+	Epoch           string `json:"epoch"`
 	Sequence        uint64 `json:"sequence"`
 	ExpiresAt       int64  `json:"expiresAt"`
 	Suite           string `json:"suite"`
@@ -145,8 +151,9 @@ func parseHello(message []byte) (helloMessage, error) {
 	if err := decodeStrict(message, &hello); err != nil {
 		return hello, err
 	}
-	if hello.ProtocolVersion != protocolVersion || !validIdentity(hello.Identity) {
-		return hello, errors.New("invalid hello protocol or identity")
+	if hello.ProtocolVersion != protocolVersion || !validIdentity(hello.Identity) ||
+		!noncePattern.MatchString(hello.Nonce) {
+		return hello, errors.New("invalid hello protocol, identity or nonce")
 	}
 
 	switch hello.Type {
@@ -181,6 +188,7 @@ func parseEnvelope(message []byte, now time.Time) (relayEnvelope, error) {
 		!uuidPattern.MatchString(envelope.MessageID) ||
 		!keyIDPattern.MatchString(envelope.SenderKeyID) ||
 		!keyIDPattern.MatchString(envelope.RecipientKeyID) ||
+		!keyIDPattern.MatchString(envelope.Epoch) ||
 		envelope.ExpiresAt <= nowMilliseconds ||
 		envelope.ExpiresAt > now.Add(maxEnvelopeTTL).UnixMilli() ||
 		!validBase64URL(envelope.EncapsulatedKey, 256) ||
@@ -191,7 +199,7 @@ func parseEnvelope(message []byte, now time.Time) (relayEnvelope, error) {
 }
 
 func validIdentity(identity publicIdentity) bool {
-	return identity.Version == protocolVersion &&
+	return identity.Version == identityVersion &&
 		identity.Suite == hpkeSuiteID &&
 		keyIDPattern.MatchString(identity.KeyID) &&
 		validBase64URL(identity.PublicKey, 1024)

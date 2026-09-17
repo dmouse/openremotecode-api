@@ -22,6 +22,7 @@ func TestDevelopmentRelayRoutesOpaqueEnvelopes(t *testing.T) {
 	connector := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "connector.hello",
+		Nonce:           testNonce(),
 		PluginVersion:   "0.1.0",
 		Identity:        testIdentity(connectorKeyID),
 		Capabilities:    []string{"session.list"},
@@ -29,6 +30,7 @@ func TestDevelopmentRelayRoutesOpaqueEnvelopes(t *testing.T) {
 	client := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "client.hello",
+		Nonce:           testNonce(),
 		Identity:        testIdentity(clientKeyID),
 	})
 
@@ -102,6 +104,7 @@ func TestDevelopmentRelayNotifiesConnectorOfClientPresence(t *testing.T) {
 	connector := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "connector.hello",
+		Nonce:           testNonce(),
 		PluginVersion:   "0.1.0",
 		Identity:        testIdentity(connectorKeyID),
 		Capabilities:    []string{"session.list"},
@@ -109,6 +112,7 @@ func TestDevelopmentRelayNotifiesConnectorOfClientPresence(t *testing.T) {
 	client := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "client.hello",
+		Nonce:           testNonce(),
 		Identity:        testIdentity(clientKeyID),
 	})
 
@@ -162,11 +166,13 @@ func TestDevelopmentRelayNotifiesLateConnectorOfExistingClient(t *testing.T) {
 	client := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "client.hello",
+		Nonce:           testNonce(),
 		Identity:        testIdentity(clientKeyID),
 	})
 	connector := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "connector.hello",
+		Nonce:           testNonce(),
 		PluginVersion:   "0.1.0",
 		Identity:        testIdentity(connectorKeyID),
 		Capabilities:    []string{"session.list"},
@@ -200,12 +206,14 @@ func TestDevelopmentRelayRejectsSenderSpoofing(t *testing.T) {
 	connector := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "connector.hello",
+		Nonce:           testNonce(),
 		PluginVersion:   "0.1.0",
 		Identity:        testIdentity(connectorKeyID),
 	})
 	client := connectPeer(t, websocketURL, helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "client.hello",
+		Nonce:           testNonce(),
 		Identity:        testIdentity(clientKeyID),
 	})
 	if _, _, err := client.ReadMessage(); err != nil {
@@ -284,9 +292,13 @@ func connectPeer(t *testing.T, websocketURL string, hello helloMessage) *websock
 	return connection
 }
 
+func testNonce() string {
+	return strings.Repeat("n", 22)
+}
+
 func testIdentity(keyID string) publicIdentity {
 	return publicIdentity{
-		Version:   protocolVersion,
+		Version:   identityVersion,
 		Suite:     hpkeSuiteID,
 		KeyID:     keyID,
 		PublicKey: "AQ",
@@ -300,6 +312,7 @@ func testEnvelope(senderKeyID, recipientKeyID string) relayEnvelope {
 		MessageID:       "123e4567-e89b-42d3-a456-426614174000",
 		SenderKeyID:     senderKeyID,
 		RecipientKeyID:  recipientKeyID,
+		Epoch:           strings.Repeat("e", 43),
 		Sequence:        0,
 		ExpiresAt:       time.Now().Add(time.Minute).UnixMilli(),
 		Suite:           hpkeSuiteID,

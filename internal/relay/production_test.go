@@ -48,7 +48,7 @@ func TestProductionRelayClosesIdleRevokedConnector(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if err := connection.WriteJSON(helloMessage{ProtocolVersion: protocolVersion, Type: "connector.hello", PluginVersion: "0.1.0", Identity: identity}); err != nil {
+	if err := connection.WriteJSON(helloMessage{ProtocolVersion: protocolVersion, Type: "connector.hello", Nonce: testNonce(), PluginVersion: "0.1.0", Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := connection.ReadMessage(); err != nil {
@@ -92,6 +92,7 @@ func TestProductionRelayClosesAtAuthorizationLeaseExpiry(t *testing.T) {
 	if err := connection.WriteJSON(helloMessage{
 		ProtocolVersion: protocolVersion,
 		Type:            "connector.hello",
+		Nonce:           testNonce(),
 		PluginVersion:   "0.1.0",
 		Identity:        identity,
 	}); err != nil {
