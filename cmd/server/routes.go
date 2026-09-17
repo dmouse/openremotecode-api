@@ -25,6 +25,7 @@ type httpModule interface {
 
 func RegisterRoutes(config Config, services Services, pool *sql.DB, logger *slog.Logger) (*gin.Engine, func()) {
 	router := httpserver.NewRouter(logger)
+	router.Use(httpserver.RequireAccessTag(config.ClientAccessTag))
 
 	origins := config.AllowedOrigins
 	proxies := config.TrustedProxies

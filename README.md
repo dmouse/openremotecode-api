@@ -194,6 +194,12 @@ Configure the edge to expose HTTPS/WSS only, send Strict-Transport-Security, sup
 
 See the [transport security ADR](../packages/agents/opencode/docs/adr/0004-transport-security.md) for the threat analysis and test coverage. Certificate issuance, proxy configuration, and verification of a deployed endpoint are deployment responsibilities.
 
+## Client Access Tag
+
+Every request from the plugin and mobile client carries an `X-Orc-Access` header. Set `CLIENT_ACCESS_TAG` to the value your release of those clients sends and the server rejects any request missing or mismatching it, before it reaches auth or business logic; leave it unset (the default) to disable the check. `/health/live` and `/health/ready` are always exempt, since container and edge health probes call them directly without application headers.
+
+This is **not** an authentication or authorization control and must never be treated as one: the expected value ships in this project's open-source plugin source and in the compiled mobile app, so anyone can read or extract it. It only reduces log noise from automated scanners and bots that don't bother sending it. Real access control is unchanged — it still comes entirely from account, device, connector, and session credentials. Because the value is embedded in shipped clients rather than issued per device, rotating it requires a new plugin/mobile release; older clients are rejected until they update.
+
 ## Health
 
 - `GET /health/live` reports whether the HTTP process is running.

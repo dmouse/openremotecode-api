@@ -47,6 +47,11 @@ type Config struct {
 	// verify against, and the route reports itself unavailable rather than failing
 	// every assertion as invalid.
 	GoogleAudiences []string
+	// ClientAccessTag, when set, is compared against the X-Orc-Access header the
+	// plugin and mobile client send on every request (httpserver.RequireAccessTag).
+	// It is not a secret or a security control — see that function's doc comment —
+	// only an operational noise filter, off by default.
+	ClientAccessTag string
 }
 
 // SMTPConfig is empty only in development, where an unset host selects the mailer
@@ -165,6 +170,7 @@ func LoadConfig() (Config, error) {
 		return Config{}, errors.New("invalid TRUSTED_PROXY_CIDRS value")
 	}
 	config.GoogleAudiences = parseList(settings.GetString("GOOGLE_OAUTH_AUDIENCES"))
+	config.ClientAccessTag = settings.GetString("CLIENT_ACCESS_TAG")
 	return config, nil
 }
 
