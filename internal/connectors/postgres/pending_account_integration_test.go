@@ -113,6 +113,12 @@ func TestPendingAccountCannotReachConnectorRoutes(t *testing.T) {
 		// are covered by the pairing lifecycle test.
 		"POST /v1/connector-pairings/:pairingID/confirm": {body: `{"deviceId":"dev_unknown_device_0001"}`},
 		"POST /v1/relay/tickets":                         {body: `{}`},
+		// Device credential rotation authenticates the account, the session, and the current
+		// device cookie together. Like relay admission, the missing cookie makes an active
+		// account answer 401 as well, so neither can demonstrate the fixture; the pending
+		// half is what this test owns for them.
+		"POST /v1/devices/self/rotate":          {body: `{"deviceId":"dev_unknown_device_0001"}`},
+		"POST /v1/devices/self/rotate/activate": {body: `{"deviceId":"dev_unknown_device_0001"}`},
 	}
 	// Routes that authenticate a connector credential instead of an account. A
 	// pending account's token is irrelevant to them.
@@ -122,8 +128,12 @@ func TestPendingAccountCannotReachConnectorRoutes(t *testing.T) {
 		"POST /v1/connector-pairings/:pairingID/poll":   {},
 		"POST /v1/connector-pairings/:pairingID/cancel": {},
 		"POST /v1/connectors/self/revoke":               {},
-		"GET /v1/connectors/self":                       {},
-		"HEAD /v1/connectors/self":                      {},
+		"POST /v1/connectors/self/rotate":               {},
+		// Authenticated by the pending credential a rotation issued, which is likewise
+		// a connector credential and never an account token.
+		"POST /v1/connectors/self/rotate/activate": {},
+		"GET /v1/connectors/self":                  {},
+		"HEAD /v1/connectors/self":                 {},
 	}
 
 	// Enumerating the router rather than spot-checking means a newly added route

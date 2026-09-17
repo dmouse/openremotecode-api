@@ -39,9 +39,13 @@ type ConnectorService interface {
 	PollPairing(context.Context, string) (connectors.PollPairingResult, error)
 	CancelPairing(context.Context, string, string) error
 	RevokeConnector(context.Context, string) error
+	RotateConnectorCredential(context.Context, string) (connectors.RotationResult, error)
+	ActivateConnectorCredential(context.Context, string) (time.Time, error)
 	RevokeAccountConnector(context.Context, string, string) error
 	RenameAccountConnector(context.Context, string, string, string) (connectors.Connector, error)
 	OwnConnector(context.Context, string) (connectors.Connector, error)
+	RotateDeviceCredential(context.Context, string, string, string, string) (connectors.RotationResult, error)
+	ActivateDeviceCredential(context.Context, string, string, string, string) (time.Time, error)
 	IssueBrowserTicket(context.Context, string, string, string, string, time.Time) (connectors.TicketResult, error)
 	IssueConnectorTicket(context.Context, string) (connectors.TicketResult, error)
 	ListConnectors(context.Context, string) ([]connectors.Connector, error)
@@ -114,12 +118,16 @@ func (handler *Handler) RegisterRoutes(router gin.IRouter) {
 	pairings.POST("/:pairingID/confirm", handler.browser(handler.claimLimiter, handler.confirmPairing))
 
 	router.POST("/v1/devices/challenge", handler.browser(handler.claimLimiter, handler.deviceChallenge))
+	router.POST("/v1/devices/self/rotate", handler.browser(handler.ticketLimiter, handler.rotateDeviceCredential))
+	router.POST("/v1/devices/self/rotate/activate", handler.browser(handler.ticketLimiter, handler.activateDeviceCredential))
 	router.POST("/v1/relay/tickets", handler.limited(handler.ticketLimiter, handler.issueTicket))
 
 	connectors := router.Group("/v1/connectors")
 	connectors.GET("", gin.WrapF(handler.listConnectors))
 	connectors.HEAD("", gin.WrapF(handler.listConnectors))
 	connectors.POST("/self/revoke", handler.plugin(handler.ticketLimiter, handler.revokeConnector))
+	connectors.POST("/self/rotate", handler.plugin(handler.ticketLimiter, handler.rotateConnectorCredential))
+	connectors.POST("/self/rotate/activate", handler.plugin(handler.ticketLimiter, handler.activateConnectorCredential))
 	connectors.POST("/:connectorID/revoke", handler.browser(handler.ticketLimiter, handler.revokeAccountConnector))
 	connectors.POST("/:connectorID/rename", handler.browser(handler.ticketLimiter, handler.renameAccountConnector))
 	connectors.GET("/self", handler.plugin(handler.ticketLimiter, handler.ownConnector))
@@ -293,6 +301,41 @@ func (handler *Handler) revokeConnector(response http.ResponseWriter, request *h
 		return
 	}
 	response.WriteHeader(http.StatusNoContent)
+}
+
+// rotateConnectorCredential issues a replacement the caller must activate. The current
+// credential keeps working until then, so a plugin that never persists this one is not
+// locked out.
+func (handler *Handler) rotateConnectorCredential(response http.ResponseWriter, request *http.Request) {
+	credential, err := authorizationToken(request, "Bearer")
+	if err != nil {
+		handler.writeServiceError(response, "rotate_connector_credential", connectors.ErrUnauthorized)
+		return
+	}
+	result, err := handler.connectors.RotateConnectorCredential(request.Context(), credential)
+	if err != nil {
+		handler.writeServiceError(response, "rotate_connector_credential", err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, rotateConnectorResponse{
+		Credential: result.Credential, ActivateBy: result.ActivateBy,
+	})
+}
+
+// activateConnectorCredential is authenticated by the pending credential, which is not the
+// live one yet, so it commits the rotation the caller has already made durable.
+func (handler *Handler) activateConnectorCredential(response http.ResponseWriter, request *http.Request) {
+	credential, err := authorizationToken(request, "Bearer")
+	if err != nil {
+		handler.writeServiceError(response, "activate_connector_credential", connectors.ErrUnauthorized)
+		return
+	}
+	expiresAt, err := handler.connectors.ActivateConnectorCredential(request.Context(), credential)
+	if err != nil {
+		handler.writeServiceError(response, "activate_connector_credential", err)
+		return
+	}
+	writeJSON(response, http.StatusOK, activateConnectorResponse{CredentialExpiresAt: expiresAt})
 }
 
 func (handler *Handler) issueTicket(response http.ResponseWriter, request *http.Request) {
@@ -479,11 +522,71 @@ func (handler *Handler) writeServiceError(response http.ResponseWriter, operatio
 }
 
 func (handler *Handler) setDeviceCookie(response http.ResponseWriter, result connectors.ConfirmPairingResult) {
+	handler.writeDeviceCookie(response, result.DeviceCredential, result.DeviceCredentialExpiresAt)
+}
+
+func (handler *Handler) writeDeviceCookie(response http.ResponseWriter, credential string, expiresAt time.Time) {
 	http.SetCookie(response, &http.Cookie{
-		Name: handler.cookieName, Value: result.DeviceCredential, Path: handler.cookiePath,
-		Expires: result.DeviceCredentialExpiresAt, MaxAge: max(1, int(result.DeviceCredentialExpiresAt.Sub(handler.now()).Seconds())),
+		Name: handler.cookieName, Value: credential, Path: handler.cookiePath,
+		Expires: expiresAt, MaxAge: max(1, int(expiresAt.Sub(handler.now()).Seconds())),
 		HttpOnly: true, Secure: handler.cookieSecure, SameSite: http.SameSiteStrictMode,
 	})
+}
+
+// deviceRequest authenticates a device the way ticket issuance does: an account principal,
+// the device ID from the body, and the current device cookie, all three together.
+func (handler *Handler) deviceRequest(response http.ResponseWriter, request *http.Request, operation string) (principal identity.AccessPrincipal, deviceID, credential string, ok bool) {
+	principal, ok = handler.accessPrincipal(response, request)
+	if !ok {
+		return principal, "", "", false
+	}
+	var input struct {
+		DeviceID string `json:"deviceId"`
+	}
+	if err := decodeJSON(response, request, &input); err != nil {
+		writeDecodeError(response, err)
+		return principal, "", "", false
+	}
+	cookie, err := request.Cookie(handler.cookieName)
+	if err != nil || input.DeviceID == "" {
+		handler.writeServiceError(response, operation, connectors.ErrUnauthorized)
+		return principal, "", "", false
+	}
+	return principal, input.DeviceID, cookie.Value, true
+}
+
+// rotateDeviceCredential issues a replacement the caller must activate. The current cookie
+// keeps working until then, so a client that never persists this one is not locked out.
+func (handler *Handler) rotateDeviceCredential(response http.ResponseWriter, request *http.Request) {
+	principal, deviceID, credential, ok := handler.deviceRequest(response, request, "rotate_device_credential")
+	if !ok {
+		return
+	}
+	result, err := handler.connectors.RotateDeviceCredential(request.Context(), principal.Account.ID, principal.SessionID, deviceID, credential)
+	if err != nil {
+		handler.writeServiceError(response, "rotate_device_credential", err)
+		return
+	}
+	// The pending credential is returned in the body, not as a cookie: writing it as one
+	// would replace the live cookie the client still needs until it activates.
+	writeJSON(response, http.StatusCreated, rotateDeviceResponse{
+		Credential: result.Credential, ActivateBy: result.ActivateBy,
+	})
+}
+
+// activateDeviceCredential commits a pending rotation and only then writes the new cookie.
+func (handler *Handler) activateDeviceCredential(response http.ResponseWriter, request *http.Request) {
+	principal, deviceID, credential, ok := handler.deviceRequest(response, request, "activate_device_credential")
+	if !ok {
+		return
+	}
+	expiresAt, err := handler.connectors.ActivateDeviceCredential(request.Context(), principal.Account.ID, principal.SessionID, deviceID, credential)
+	if err != nil {
+		handler.writeServiceError(response, "activate_device_credential", err)
+		return
+	}
+	handler.writeDeviceCookie(response, credential, expiresAt)
+	writeJSON(response, http.StatusOK, activateDeviceResponse{CredentialExpiresAt: expiresAt})
 }
 
 type challengeResponse struct {
@@ -530,6 +633,20 @@ type ticketResponse struct {
 	Ticket       string    `json:"ticket"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 	WebSocketURL string    `json:"webSocketUrl"`
+}
+type rotateDeviceResponse struct {
+	Credential string    `json:"credential"`
+	ActivateBy time.Time `json:"activateBy"`
+}
+type activateDeviceResponse struct {
+	CredentialExpiresAt time.Time `json:"credentialExpiresAt"`
+}
+type rotateConnectorResponse struct {
+	Credential string    `json:"credential"`
+	ActivateBy time.Time `json:"activateBy"`
+}
+type activateConnectorResponse struct {
+	CredentialExpiresAt time.Time `json:"credentialExpiresAt"`
 }
 type connectorDocument struct {
 	ID        string                    `json:"id"`

@@ -108,9 +108,10 @@ func SetupServices(
 	connectorService, err := connectors.NewService(
 		connectorspostgres.NewStore(db),
 		connectors.ServiceOptions{
-			PairingCodeKey:  []byte(config.PairingCodeKey),
-			ServiceID:       config.ServiceID,
-			VerificationURI: config.VerificationURI,
+			PairingCodeKey:      []byte(config.PairingCodeKey),
+			DeviceCredentialKey: []byte(config.DeviceCredentialKey),
+			ServiceID:           config.ServiceID,
+			VerificationURI:     config.VerificationURI,
 			AuthorizeAccount: func(ctx context.Context, userID string) error {
 				if err := identityService.AuthorizeAccount(ctx, userID); errors.Is(err, identity.ErrUnauthorized) {
 					return connectors.ErrUnauthorized

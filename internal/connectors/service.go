@@ -24,20 +24,27 @@ const (
 	defaultDeviceCredentialLifetime    = 365 * 24 * time.Hour
 	defaultConnectorCredentialLifetime = 90 * 24 * time.Hour
 	defaultTicketLifetime              = 30 * time.Second
-	defaultPollInterval                = 2 * time.Second
-	defaultAuthorizationLease          = 5 * time.Minute
+	// A rotation the plugin never activates lapses this soon after it is issued.
+	defaultCredentialActivationWindow = 15 * time.Minute
+	defaultPollInterval               = 2 * time.Second
+	defaultAuthorizationLease         = 5 * time.Minute
 )
 
 type ServiceOptions struct {
-	Now                         func() time.Time
-	Random                      io.Reader
-	PairingCodeKey              []byte
+	Now            func() time.Time
+	Random         io.Reader
+	PairingCodeKey []byte
+	// Derives device credentials. Kept separate from PairingCodeKey so that rotating the
+	// user-code key does not invalidate every paired device. Seeded from PairingCodeKey
+	// when unset, which keeps an existing deployment's devices valid.
+	DeviceCredentialKey         []byte
 	ServiceID                   string
 	VerificationURI             string
 	ChallengeLifetime           time.Duration
 	PairingLifetime             time.Duration
 	DeviceCredentialLifetime    time.Duration
 	ConnectorCredentialLifetime time.Duration
+	CredentialActivationWindow  time.Duration
 	TicketLifetime              time.Duration
 	PollInterval                time.Duration
 	AuthorizeAccount            func(context.Context, string) error
@@ -49,12 +56,14 @@ type Service struct {
 	now                         func() time.Time
 	random                      io.Reader
 	pairingCodeKey              []byte
+	deviceCredentialKey         []byte
 	serviceID                   string
 	verificationURI             string
 	challengeLifetime           time.Duration
 	pairingLifetime             time.Duration
 	deviceCredentialLifetime    time.Duration
 	connectorCredentialLifetime time.Duration
+	credentialActivationWindow  time.Duration
 	ticketLifetime              time.Duration
 	pollInterval                time.Duration
 	authorizeAccount            func(context.Context, string) error
@@ -70,6 +79,12 @@ func NewService(repository Repository, options ServiceOptions) (*Service, error)
 	}
 	if len(options.PairingCodeKey) < 32 {
 		return nil, errors.New("pairing code key must contain at least 32 bytes")
+	}
+	if len(options.DeviceCredentialKey) == 0 {
+		options.DeviceCredentialKey = options.PairingCodeKey
+	}
+	if len(options.DeviceCredentialKey) < 32 {
+		return nil, errors.New("device credential key must contain at least 32 bytes")
 	}
 	if strings.TrimSpace(options.ServiceID) == "" || len(options.ServiceID) > 128 {
 		return nil, errors.New("service ID is invalid")
@@ -95,6 +110,9 @@ func NewService(repository Repository, options ServiceOptions) (*Service, error)
 	if options.ConnectorCredentialLifetime <= 0 {
 		options.ConnectorCredentialLifetime = defaultConnectorCredentialLifetime
 	}
+	if options.CredentialActivationWindow <= 0 {
+		options.CredentialActivationWindow = defaultCredentialActivationWindow
+	}
 	if options.TicketLifetime <= 0 {
 		options.TicketLifetime = defaultTicketLifetime
 	}
@@ -106,12 +124,14 @@ func NewService(repository Repository, options ServiceOptions) (*Service, error)
 		now:                         options.Now,
 		random:                      options.Random,
 		pairingCodeKey:              append([]byte(nil), options.PairingCodeKey...),
+		deviceCredentialKey:         append([]byte(nil), options.DeviceCredentialKey...),
 		serviceID:                   options.ServiceID,
 		verificationURI:             options.VerificationURI,
 		challengeLifetime:           options.ChallengeLifetime,
 		pairingLifetime:             options.PairingLifetime,
 		deviceCredentialLifetime:    options.DeviceCredentialLifetime,
 		connectorCredentialLifetime: options.ConnectorCredentialLifetime,
+		credentialActivationWindow:  options.CredentialActivationWindow,
 		ticketLifetime:              options.TicketLifetime,
 		pollInterval:                options.PollInterval,
 		authorizeAccount:            options.AuthorizeAccount,
@@ -534,6 +554,130 @@ func (service *Service) IssueBrowserTicket(ctx context.Context, userID, sessionI
 	return service.issueTicket(ctx, RelayRoleClient, userID, sessionID, deviceID, hashSecret(credential), authorizationExpiresAt)
 }
 
+// RotateDeviceCredential issues a replacement for the device credential without disturbing
+// the live one. Authenticated exactly as ticket issuance is: an account session, the device
+// ID, and the current credential together, so the device ID is never the sole authority.
+func (service *Service) RotateDeviceCredential(ctx context.Context, userID, sessionID, deviceID, credential string) (RotationResult, error) {
+	if userID == "" || sessionID == "" || deviceID == "" || !validToken(credential, "ord_") {
+		return RotationResult{}, ErrUnauthorized
+	}
+	now := service.now().UTC()
+	var result RotationResult
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+		device, err := store.DeviceByCredentialForUpdate(ctx, hashSecret(credential))
+		if err != nil {
+			return err
+		}
+		if device.ID != deviceID || device.UserID != userID || device.ActivatedAt == nil || device.RevokedAt != nil ||
+			device.CredentialExpiresAt == nil || !device.CredentialExpiresAt.After(now) {
+			return ErrUnauthorized
+		}
+		if err := service.authorizeAccount(ctx, device.UserID); err != nil {
+			return err
+		}
+		if err := service.authorizeSession(ctx, device.UserID, sessionID); err != nil {
+			return err
+		}
+		issued, err := issueToken(service.random, "ord_")
+		if err != nil {
+			return err
+		}
+		// A retried rotation replaces any pending one; only the newest can be activated.
+		activationDeadline := now.Add(service.credentialActivationWindow)
+		device.PendingCredentialHash = hashSecret(issued)
+		device.PendingCredentialExpiresAt = &activationDeadline
+		if err := store.SaveDevice(ctx, device); err != nil {
+			return err
+		}
+		if err := store.AppendAuditEvent(ctx, AuditEvent{
+			UserID: &device.UserID, DeviceID: &device.ID,
+			EventType: "device.credential.rotated", OccurredAt: now,
+		}); err != nil {
+			return err
+		}
+		result = RotationResult{Credential: issued, ActivateBy: activationDeadline}
+		return nil
+	})
+	if err != nil {
+		return RotationResult{}, normalizeAuthorizationError(err)
+	}
+	return result, nil
+}
+
+// ActivateDeviceCredential commits a pending rotation. It is the only call that retires the
+// previous credential, so the client controls when that happens and can make the new value
+// durable first.
+func (service *Service) ActivateDeviceCredential(ctx context.Context, userID, sessionID, deviceID, credential string) (time.Time, error) {
+	if userID == "" || sessionID == "" || deviceID == "" || !validToken(credential, "ord_") {
+		return time.Time{}, ErrUnauthorized
+	}
+	now := service.now().UTC()
+	var expiresAt time.Time
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+		hash := hashSecret(credential)
+		device, err := store.DeviceByAnyCredentialForUpdate(ctx, hash)
+		if err != nil {
+			return err
+		}
+		if device.ID != deviceID || device.UserID != userID || device.ActivatedAt == nil || device.RevokedAt != nil {
+			return ErrUnauthorized
+		}
+		if err := service.authorizeAccount(ctx, device.UserID); err != nil {
+			return err
+		}
+		if err := service.authorizeSession(ctx, device.UserID, sessionID); err != nil {
+			return err
+		}
+		// Activating the credential that is already current is a retry of a committed
+		// rotation, which must stay idempotent after a lost response.
+		if hmac.Equal(hash, device.CredentialHash) {
+			if device.CredentialExpiresAt == nil || !device.CredentialExpiresAt.After(now) {
+				return ErrUnauthorized
+			}
+			expiresAt = *device.CredentialExpiresAt
+			return nil
+		}
+		if device.PendingCredentialHash == nil || !hmac.Equal(hash, device.PendingCredentialHash) ||
+			device.PendingCredentialExpiresAt == nil || !device.PendingCredentialExpiresAt.After(now) {
+			return ErrUnauthorized
+		}
+		// The lifetime starts here, so a provisional credential never burns time unused.
+		expiresAt = now.Add(service.deviceCredentialLifetime)
+		device.CredentialHash = hash
+		device.CredentialExpiresAt = &expiresAt
+		device.PendingCredentialHash = nil
+		device.PendingCredentialExpiresAt = nil
+		if err := store.SaveDevice(ctx, device); err != nil {
+			return err
+		}
+		return store.AppendAuditEvent(ctx, AuditEvent{
+			UserID: &device.UserID, DeviceID: &device.ID,
+			EventType: "device.credential.activated", OccurredAt: now,
+		})
+	})
+	if err != nil {
+		return time.Time{}, normalizeAuthorizationError(err)
+	}
+	return expiresAt, nil
+}
+
+// cancelPendingDeviceRotation discards an unactivated rotation when the device proves it is
+// still using its current credential.
+func (service *Service) cancelPendingDeviceRotation(ctx context.Context, store TransactionStore, device *Device, now time.Time) error {
+	if device.PendingCredentialHash == nil {
+		return nil
+	}
+	device.PendingCredentialHash = nil
+	device.PendingCredentialExpiresAt = nil
+	if err := store.SaveDevice(ctx, *device); err != nil {
+		return err
+	}
+	return store.AppendAuditEvent(ctx, AuditEvent{
+		UserID: &device.UserID, DeviceID: &device.ID,
+		EventType: "device.credential.rotation_cancelled", OccurredAt: now,
+	})
+}
+
 // OwnConnector returns metadata only for the connector authenticated by this credential.
 func (service *Service) OwnConnector(ctx context.Context, credential string) (Connector, error) {
 	if !validToken(credential, "orc_") {
@@ -556,6 +700,124 @@ func (service *Service) OwnConnector(ctx context.Context, credential string) (Co
 		return nil
 	})
 	return result, normalizeAuthorizationError(err)
+}
+
+// RotateConnectorCredential issues a replacement credential without disturbing the live one.
+// The rotation stays provisional until ActivateConnectorCredential commits it, so a plugin
+// that never persists or never activates the new value keeps working on its current
+// credential instead of being locked out into re-pairing.
+func (service *Service) RotateConnectorCredential(ctx context.Context, credential string) (RotationResult, error) {
+	if !validToken(credential, "orc_") {
+		return RotationResult{}, ErrUnauthorized
+	}
+	now := service.now().UTC()
+	var result RotationResult
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+		connector, err := store.ConnectorByCredentialForUpdate(ctx, hashSecret(credential))
+		if err != nil {
+			return err
+		}
+		if connector.RevokedAt != nil || connector.CredentialExpiresAt == nil || !connector.CredentialExpiresAt.After(now) {
+			return ErrUnauthorized
+		}
+		if err := service.authorizeAccount(ctx, connector.UserID); err != nil {
+			return err
+		}
+		issued, err := issueToken(service.random, "orc_")
+		if err != nil {
+			return err
+		}
+		// A retried rotation replaces any pending one; only the newest can be activated.
+		activationDeadline := now.Add(service.credentialActivationWindow)
+		connector.PendingCredentialHash = hashSecret(issued)
+		connector.PendingCredentialExpiresAt = &activationDeadline
+		if err := store.SaveConnector(ctx, connector); err != nil {
+			return err
+		}
+		if err := store.AppendAuditEvent(ctx, AuditEvent{
+			UserID: &connector.UserID, ConnectorID: &connector.ID,
+			EventType: "connector.credential.rotated", OccurredAt: now,
+		}); err != nil {
+			return err
+		}
+		result = RotationResult{Credential: issued, ActivateBy: activationDeadline}
+		return nil
+	})
+	if err != nil {
+		return RotationResult{}, normalizeAuthorizationError(err)
+	}
+	return result, nil
+}
+
+// ActivateConnectorCredential commits a pending rotation. It is the only call that retires
+// the previous credential, so the plugin controls when that happens and can make the new
+// value durable first.
+func (service *Service) ActivateConnectorCredential(ctx context.Context, credential string) (time.Time, error) {
+	if !validToken(credential, "orc_") {
+		return time.Time{}, ErrUnauthorized
+	}
+	now := service.now().UTC()
+	var expiresAt time.Time
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+		hash := hashSecret(credential)
+		connector, err := store.ConnectorByAnyCredentialForUpdate(ctx, hash)
+		if err != nil {
+			return err
+		}
+		if connector.RevokedAt != nil {
+			return ErrUnauthorized
+		}
+		if err := service.authorizeAccount(ctx, connector.UserID); err != nil {
+			return err
+		}
+		// Activating the credential that is already current is a retry of a committed
+		// rotation, which must stay idempotent after a lost response.
+		if hmac.Equal(hash, connector.CredentialHash) {
+			if connector.CredentialExpiresAt == nil || !connector.CredentialExpiresAt.After(now) {
+				return ErrUnauthorized
+			}
+			expiresAt = *connector.CredentialExpiresAt
+			return nil
+		}
+		if connector.PendingCredentialHash == nil || !hmac.Equal(hash, connector.PendingCredentialHash) ||
+			connector.PendingCredentialExpiresAt == nil || !connector.PendingCredentialExpiresAt.After(now) {
+			return ErrUnauthorized
+		}
+		// The lifetime starts here, so a provisional credential never burns time unused.
+		expiresAt = now.Add(service.connectorCredentialLifetime)
+		connector.CredentialHash = hash
+		connector.CredentialExpiresAt = &expiresAt
+		connector.PendingCredentialHash = nil
+		connector.PendingCredentialExpiresAt = nil
+		if err := store.SaveConnector(ctx, connector); err != nil {
+			return err
+		}
+		return store.AppendAuditEvent(ctx, AuditEvent{
+			UserID: &connector.UserID, ConnectorID: &connector.ID,
+			EventType: "connector.credential.activated", OccurredAt: now,
+		})
+	})
+	if err != nil {
+		return time.Time{}, normalizeAuthorizationError(err)
+	}
+	return expiresAt, nil
+}
+
+// cancelPendingRotation discards an unactivated rotation when the connector proves it is
+// still using its current credential. Returns whether the connector needs saving.
+func (service *Service) cancelPendingRotation(ctx context.Context, store TransactionStore, connector *Connector, now time.Time) error {
+	if connector.PendingCredentialHash == nil {
+		return nil
+	}
+	connector.PendingCredentialHash = nil
+	connector.PendingCredentialExpiresAt = nil
+	if err := store.SaveConnector(ctx, *connector); err != nil {
+		return err
+	}
+	return store.AppendAuditEvent(ctx, AuditEvent{
+		UserID: &connector.UserID, ConnectorID: &connector.ID,
+		EventType: "connector.credential.rotation_cancelled", OccurredAt: now,
+	})
 }
 
 // RevokeConnector authenticates the connector itself, never a caller-selected account or ID.
@@ -697,6 +959,11 @@ func (service *Service) issueTicket(ctx context.Context, role, userID, credentia
 			if device.ID != subjectID || device.UserID != userID || device.ActivatedAt == nil || device.RevokedAt != nil || device.CredentialExpiresAt == nil || !device.CredentialExpiresAt.After(now) {
 				return ErrUnauthorized
 			}
+			// Connecting on the current credential proves the device never took up a
+			// pending rotation, so that rotation is discarded rather than left to expire.
+			if err := service.cancelPendingDeviceRotation(ctx, store, &device, now); err != nil {
+				return err
+			}
 			identity = device.Identity
 			if authorizationExpiresAt.IsZero() || device.CredentialExpiresAt.Before(authorizationExpiresAt) {
 				authorizationExpiresAt = *device.CredentialExpiresAt
@@ -708,6 +975,11 @@ func (service *Service) issueTicket(ctx context.Context, role, userID, credentia
 			}
 			if connector.RevokedAt != nil || connector.CredentialExpiresAt == nil || !connector.CredentialExpiresAt.After(now) {
 				return ErrUnauthorized
+			}
+			// Connecting on the current credential proves the connector never took up a
+			// pending rotation, so that rotation is discarded rather than left to expire.
+			if err := service.cancelPendingRotation(ctx, store, &connector, now); err != nil {
+				return err
 			}
 			userID, subjectID, credentialID, identity = connector.UserID, connector.ID, connector.ID, connector.Identity
 			authorizationExpiresAt = *connector.CredentialExpiresAt
@@ -928,7 +1200,7 @@ func deriveConnectorCredential(pairingSecret string) string {
 }
 
 func (service *Service) deriveDeviceCredential(keyID string) string {
-	mac := hmac.New(sha256.New, service.pairingCodeKey)
+	mac := hmac.New(sha256.New, service.deviceCredentialKey)
 	_, _ = mac.Write([]byte("opencode-remote/device-credential/v1\x00"))
 	_, _ = mac.Write([]byte(keyID))
 	return "ord_" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))

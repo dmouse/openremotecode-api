@@ -12,6 +12,7 @@ import (
 type revocationStore struct {
 	TransactionStore
 	connectors map[string]Connector
+	devices    map[string]Device
 	audits     []AuditEvent
 	auditError error
 }
@@ -55,6 +56,10 @@ func (repository revocationRepository) WithinTransaction(_ context.Context, oper
 	copy.connectors = make(map[string]Connector)
 	for id, connector := range repository.store.connectors {
 		copy.connectors[id] = connector
+	}
+	copy.devices = make(map[string]Device)
+	for id, device := range repository.store.devices {
+		copy.devices[id] = device
 	}
 	if err := operation(&copy); err != nil {
 		return err

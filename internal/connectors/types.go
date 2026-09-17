@@ -74,9 +74,13 @@ type Device struct {
 	Identity            PublicIdentity
 	CredentialHash      []byte
 	CredentialExpiresAt *time.Time
-	CreatedAt           time.Time
-	ActivatedAt         *time.Time
-	RevokedAt           *time.Time
+	// A rotation is provisional: the pending credential grants nothing until it is
+	// activated, and expires at PendingCredentialExpiresAt if it never is.
+	PendingCredentialHash      []byte
+	PendingCredentialExpiresAt *time.Time
+	CreatedAt                  time.Time
+	ActivatedAt                *time.Time
+	RevokedAt                  *time.Time
 }
 
 type Connector struct {
@@ -86,8 +90,12 @@ type Connector struct {
 	Identity            PublicIdentity
 	CredentialHash      []byte
 	CredentialExpiresAt *time.Time
-	CreatedAt           time.Time
-	RevokedAt           *time.Time
+	// A rotation is provisional: the pending credential grants nothing until it is
+	// activated, and expires at PendingCredentialExpiresAt if it never is.
+	PendingCredentialHash      []byte
+	PendingCredentialExpiresAt *time.Time
+	CreatedAt                  time.Time
+	RevokedAt                  *time.Time
 }
 
 type Trust struct {
@@ -188,6 +196,13 @@ type TicketResult struct {
 	ExpiresAt time.Time
 }
 
+// RotationResult carries a credential that grants nothing until it is activated. ActivateBy
+// is the deadline after which the rotation lapses and the current credential simply remains.
+type RotationResult struct {
+	Credential string
+	ActivateBy time.Time
+}
+
 type Admission struct {
 	UserID                 string
 	Role                   string
@@ -215,11 +230,17 @@ type TransactionStore interface {
 	DeviceByKeyIDForUpdate(context.Context, string) (Device, error)
 	DeviceByIDForUpdate(context.Context, string) (Device, error)
 	DeviceByCredentialForUpdate(context.Context, []byte) (Device, error)
+	// Matches a hash against either the live or the pending credential, so an
+	// activation can be authorized by a credential that is not current yet.
+	DeviceByAnyCredentialForUpdate(context.Context, []byte) (Device, error)
 	CreateDevice(context.Context, Device) error
 	SaveDevice(context.Context, Device) error
 	ConnectorByKeyIDForUpdate(context.Context, string) (Connector, error)
 	ConnectorByIDForUpdate(context.Context, string) (Connector, error)
 	ConnectorByCredentialForUpdate(context.Context, []byte) (Connector, error)
+	// Matches a hash against either the live or the pending credential, so an
+	// activation can be authorized by a credential that is not current yet.
+	ConnectorByAnyCredentialForUpdate(context.Context, []byte) (Connector, error)
 	CreateConnector(context.Context, Connector) error
 	SaveConnector(context.Context, Connector) error
 	UpsertTrust(context.Context, Trust) error

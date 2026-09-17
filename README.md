@@ -98,6 +98,10 @@ The current API includes:
 - `GET /v1/connectors`
 - `GET /v1/connectors/self` (connector ID and original linking date, authenticated by its own credential)
 - `POST /v1/connectors/self/revoke` (connector bearer credential only)
+- `POST /v1/devices/self/rotate` (account session + device ID + current device cookie)
+- `POST /v1/devices/self/rotate/activate` (authenticated by the pending device cookie; commits the rotation)
+- `POST /v1/connectors/self/rotate` (connector bearer credential only; issues a replacement the caller must activate)
+- `POST /v1/connectors/self/rotate/activate` (authenticated by the pending credential; commits the rotation)
 - `POST /v1/relay/tickets`
 - `GET /v1/relay` (WebSocket upgrade)
 
@@ -106,6 +110,20 @@ Registration creates a `pending` account and mails it a six-digit code; only `PO
 Passwords use Argon2id with the RFC 9106 low-memory recommendation. Access credentials are opaque, short lived, and kept out of cookies. Refresh credentials are hashed in PostgreSQL, rotate on every use, and use the existing HTTP-only, SameSite Strict cookie contract. The native client extracts the credential into secure storage and forwards it explicitly to the same server; it does not use a browser cookie jar. Reusing a rotated refresh credential revokes the entire auth session.
 
 Pairing challenges are single use. Pairing secrets, human codes, mobile device credentials, connector credentials, and relay tickets are stored only as hashes. Both mobile and connector identities prove possession with standard P-256 ECDSA/SHA-256 signatures. The connector must poll and observe the stable transcript before confirmation. Confirmation idempotently creates the account-scoped trust edge and installs both durable credentials in one transaction.
+
+A connector renews its 90-day credential without re-pairing. Rotation issues a replacement that grants nothing until the connector activates it, so a plugin that never persists or never activates the new value keeps working on its current one; connecting on the current credential instead cancels the pending rotation, and an unactivated rotation lapses after fifteen minutes without invalidating anything. The renewed lifetime starts at activation. Rotation is not revocation and does not close a live relay connection, since admission resolves the connector by ID rather than by credential value. Device credentials rotate the same way, with the same provisional-until-activated semantics; the
+replacement is returned in the body and only becomes a cookie once activated, so the credential the
+client still needs is never overwritten. Device rotation is authenticated by the account session,
+the device ID and the current device cookie together, exactly as relay-ticket issuance is.
+
+`DEVICE_CREDENTIAL_KEY` derives device credentials and is separate from `PAIRING_CODE_KEY`, which
+hashes user codes; it is seeded from `PAIRING_CODE_KEY` when unset, so an existing deployment keeps
+its devices. The split exists so either key can be rotated without disturbing what the other derives. Only
+pairing confirmation derives a device credential; every authentication path resolves a device by the
+stored hash of the credential presented, so rotating `DEVICE_CREDENTIAL_KEY` leaves already-paired
+devices working. The only casualty is the re-confirmation of a pairing completed under the previous
+key, and a pairing lives ten minutes. See [ADR 0012](docs/adr/0012-connector-credential-rotation.md)
+and [ADR 0013](docs/adr/0013-device-credential-rotation.md).
 
 Compose explicitly enables insecure cookies and the legacy unauthenticated relay under `APP_ENV=development`. It leaves `SMTP_HOST` unset, which selects the development mailer that writes verification codes to the server log rather than sending them — read the code from `docker compose logs server`. Mobile and plugin connections use the authenticated `/v1/relay` path. Launch the local plugin with `OPENCODE_REMOTE_ALLOW_INSECURE_LOOPBACK=true opencode` to opt into the development stack's HTTP/WS transport. Outside this development stack, development features are disabled and cookies default to `Secure` host-bound names. Production startup requires a secret `PAIRING_CODE_KEY`, stable `SERVICE_ID`, HTTPS `PAIRING_VERIFICATION_URI`, working SMTP settings as described below, and valid TLS certificate files. Trust only forwarding proxies that sanitize and append headers.
 

@@ -107,6 +107,15 @@ func (store *transactionStore) DeviceByCredentialForUpdate(ctx context.Context, 
 	return store.deviceForUpdate(ctx, "credential_hash = ?", hash)
 }
 
+func (store *transactionStore) DeviceByAnyCredentialForUpdate(ctx context.Context, hash []byte) (connectors.Device, error) {
+	var model DeviceModel
+	err := store.lock(ctx).Where("credential_hash = ? OR pending_credential_hash = ?", hash, hash).First(&model).Error
+	if err != nil {
+		return connectors.Device{}, translateError(err)
+	}
+	return deviceFromModel(model), nil
+}
+
 func (store *transactionStore) deviceForUpdate(ctx context.Context, query string, argument any) (connectors.Device, error) {
 	var model DeviceModel
 	err := store.lock(ctx).Where(query, argument).First(&model).Error
@@ -134,6 +143,15 @@ func (store *transactionStore) ConnectorByIDForUpdate(ctx context.Context, id st
 
 func (store *transactionStore) ConnectorByCredentialForUpdate(ctx context.Context, hash []byte) (connectors.Connector, error) {
 	return store.connectorForUpdate(ctx, "credential_hash = ?", hash)
+}
+
+func (store *transactionStore) ConnectorByAnyCredentialForUpdate(ctx context.Context, hash []byte) (connectors.Connector, error) {
+	var model ConnectorModel
+	err := store.lock(ctx).Where("credential_hash = ? OR pending_credential_hash = ?", hash, hash).First(&model).Error
+	if err != nil {
+		return connectors.Connector{}, translateError(err)
+	}
+	return connectorFromModel(model), nil
 }
 
 func (store *transactionStore) connectorForUpdate(ctx context.Context, query string, argument any) (connectors.Connector, error) {
@@ -229,17 +247,17 @@ func challengeFromModel(value ChallengeModel) connectors.Challenge {
 }
 
 func deviceModel(value connectors.Device) *DeviceModel {
-	return &DeviceModel{ID: value.ID, UserID: value.UserID, Name: value.Name, IdentityVersion: value.Identity.Version, IdentitySuite: value.Identity.Suite, KeyID: value.Identity.KeyID, PublicKey: value.Identity.PublicKey, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, CreatedAt: value.CreatedAt, ActivatedAt: value.ActivatedAt, RevokedAt: value.RevokedAt}
+	return &DeviceModel{ID: value.ID, UserID: value.UserID, Name: value.Name, IdentityVersion: value.Identity.Version, IdentitySuite: value.Identity.Suite, KeyID: value.Identity.KeyID, PublicKey: value.Identity.PublicKey, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, PendingCredentialHash: value.PendingCredentialHash, PendingCredentialExpiresAt: value.PendingCredentialExpiresAt, CreatedAt: value.CreatedAt, ActivatedAt: value.ActivatedAt, RevokedAt: value.RevokedAt}
 }
 func deviceFromModel(value DeviceModel) connectors.Device {
-	return connectors.Device{ID: value.ID, UserID: value.UserID, Name: value.Name, Identity: connectors.PublicIdentity{Version: value.IdentityVersion, Suite: value.IdentitySuite, KeyID: value.KeyID, PublicKey: value.PublicKey}, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, CreatedAt: value.CreatedAt, ActivatedAt: value.ActivatedAt, RevokedAt: value.RevokedAt}
+	return connectors.Device{ID: value.ID, UserID: value.UserID, Name: value.Name, Identity: connectors.PublicIdentity{Version: value.IdentityVersion, Suite: value.IdentitySuite, KeyID: value.KeyID, PublicKey: value.PublicKey}, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, PendingCredentialHash: value.PendingCredentialHash, PendingCredentialExpiresAt: value.PendingCredentialExpiresAt, CreatedAt: value.CreatedAt, ActivatedAt: value.ActivatedAt, RevokedAt: value.RevokedAt}
 }
 
 func connectorModel(value connectors.Connector) *ConnectorModel {
-	return &ConnectorModel{ID: value.ID, UserID: value.UserID, Name: value.Name, IdentityVersion: value.Identity.Version, IdentitySuite: value.Identity.Suite, KeyID: value.Identity.KeyID, PublicKey: value.Identity.PublicKey, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, CreatedAt: value.CreatedAt, RevokedAt: value.RevokedAt}
+	return &ConnectorModel{ID: value.ID, UserID: value.UserID, Name: value.Name, IdentityVersion: value.Identity.Version, IdentitySuite: value.Identity.Suite, KeyID: value.Identity.KeyID, PublicKey: value.Identity.PublicKey, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, PendingCredentialHash: value.PendingCredentialHash, PendingCredentialExpiresAt: value.PendingCredentialExpiresAt, CreatedAt: value.CreatedAt, RevokedAt: value.RevokedAt}
 }
 func connectorFromModel(value ConnectorModel) connectors.Connector {
-	return connectors.Connector{ID: value.ID, UserID: value.UserID, Name: value.Name, Identity: connectors.PublicIdentity{Version: value.IdentityVersion, Suite: value.IdentitySuite, KeyID: value.KeyID, PublicKey: value.PublicKey}, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, CreatedAt: value.CreatedAt, RevokedAt: value.RevokedAt}
+	return connectors.Connector{ID: value.ID, UserID: value.UserID, Name: value.Name, Identity: connectors.PublicIdentity{Version: value.IdentityVersion, Suite: value.IdentitySuite, KeyID: value.KeyID, PublicKey: value.PublicKey}, CredentialHash: value.CredentialHash, CredentialExpiresAt: value.CredentialExpiresAt, PendingCredentialHash: value.PendingCredentialHash, PendingCredentialExpiresAt: value.PendingCredentialExpiresAt, CreatedAt: value.CreatedAt, RevokedAt: value.RevokedAt}
 }
 
 func pairingModel(value connectors.Pairing) *PairingModel {

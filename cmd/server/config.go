@@ -28,6 +28,7 @@ type Config struct {
 	DatabaseURL                string
 	TLS                        *tls.Config
 	PairingCodeKey             string
+	DeviceCredentialKey        string
 	ServiceID                  string
 	VerificationURI            string
 	AllowedOrigins             []string
@@ -77,12 +78,15 @@ func LoadConfig() (Config, error) {
 		settings.SetDefault("PAIRING_VERIFICATION_URI", defaultVerificationURI)
 	}
 	config := Config{
-		HTTPAddress:     settings.GetString("HTTP_ADDR"),
-		DatabaseURL:     settings.GetString("DATABASE_URL"),
-		PairingCodeKey:  settings.GetString("PAIRING_CODE_KEY"),
-		ServiceID:       strings.TrimSpace(settings.GetString("SERVICE_ID")),
-		VerificationURI: strings.TrimSpace(settings.GetString("PAIRING_VERIFICATION_URI")),
-		AllowedOrigins:  strings.Split(settings.GetString("BROWSER_ORIGINS"), ","),
+		HTTPAddress:    settings.GetString("HTTP_ADDR"),
+		DatabaseURL:    settings.GetString("DATABASE_URL"),
+		PairingCodeKey: settings.GetString("PAIRING_CODE_KEY"),
+		// Separate from PAIRING_CODE_KEY so the user-code key can be rotated without
+		// invalidating every paired device. Seeded from it when unset.
+		DeviceCredentialKey: settings.GetString("DEVICE_CREDENTIAL_KEY"),
+		ServiceID:           strings.TrimSpace(settings.GetString("SERVICE_ID")),
+		VerificationURI:     strings.TrimSpace(settings.GetString("PAIRING_VERIFICATION_URI")),
+		AllowedOrigins:      strings.Split(settings.GetString("BROWSER_ORIGINS"), ","),
 		SMTP: SMTPConfig{
 			Host:        strings.TrimSpace(settings.GetString("SMTP_HOST")),
 			Port:        settings.GetInt("SMTP_PORT"),
@@ -99,6 +103,12 @@ func LoadConfig() (Config, error) {
 	}
 	if len(config.PairingCodeKey) < 32 {
 		return Config{}, errors.New("PAIRING_CODE_KEY must contain at least 32 bytes")
+	}
+	if config.DeviceCredentialKey == "" {
+		config.DeviceCredentialKey = config.PairingCodeKey
+	}
+	if len(config.DeviceCredentialKey) < 32 {
+		return Config{}, errors.New("DEVICE_CREDENTIAL_KEY must contain at least 32 bytes")
 	}
 	if development {
 		if config.ServiceID == "" {

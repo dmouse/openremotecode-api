@@ -33,9 +33,13 @@ type DeviceModel struct {
 	PublicKey           string                     `gorm:"type:varchar(1024);not null"`
 	CredentialHash      []byte                     `gorm:"type:bytea;uniqueIndex:devices_credential_hash_key;check:devices_credential_hash_length_check,credential_hash IS NULL OR octet_length(credential_hash) = 32"`
 	CredentialExpiresAt *time.Time                 `gorm:"type:timestamptz"`
-	CreatedAt           time.Time                  `gorm:"type:timestamptz;not null"`
-	ActivatedAt         *time.Time                 `gorm:"type:timestamptz"`
-	RevokedAt           *time.Time                 `gorm:"type:timestamptz;index:devices_revoked_at_idx"`
+	// A rotation stays provisional until the client activates it, so the pending
+	// credential is stored beside the live one and never replaces it on its own.
+	PendingCredentialHash      []byte     `gorm:"type:bytea;uniqueIndex:devices_pending_credential_hash_key;check:devices_pending_credential_hash_length_check,pending_credential_hash IS NULL OR octet_length(pending_credential_hash) = 32"`
+	PendingCredentialExpiresAt *time.Time `gorm:"type:timestamptz"`
+	CreatedAt                  time.Time  `gorm:"type:timestamptz;not null"`
+	ActivatedAt                *time.Time `gorm:"type:timestamptz"`
+	RevokedAt                  *time.Time `gorm:"type:timestamptz;index:devices_revoked_at_idx"`
 }
 
 func (DeviceModel) TableName() string { return "devices" }
@@ -51,8 +55,12 @@ type ConnectorModel struct {
 	PublicKey           string                     `gorm:"type:varchar(1024);not null"`
 	CredentialHash      []byte                     `gorm:"type:bytea;uniqueIndex:connectors_credential_hash_key;check:connectors_credential_hash_length_check,credential_hash IS NULL OR octet_length(credential_hash) = 32"`
 	CredentialExpiresAt *time.Time                 `gorm:"type:timestamptz"`
-	CreatedAt           time.Time                  `gorm:"type:timestamptz;not null"`
-	RevokedAt           *time.Time                 `gorm:"type:timestamptz;index:connectors_revoked_at_idx"`
+	// A rotation stays provisional until the plugin activates it, so the pending
+	// credential is stored beside the live one and never replaces it on its own.
+	PendingCredentialHash      []byte     `gorm:"type:bytea;uniqueIndex:connectors_pending_credential_hash_key;check:connectors_pending_credential_hash_length_check,pending_credential_hash IS NULL OR octet_length(pending_credential_hash) = 32"`
+	PendingCredentialExpiresAt *time.Time `gorm:"type:timestamptz"`
+	CreatedAt                  time.Time  `gorm:"type:timestamptz;not null"`
+	RevokedAt                  *time.Time `gorm:"type:timestamptz;index:connectors_revoked_at_idx"`
 }
 
 func (ConnectorModel) TableName() string { return "connectors" }
