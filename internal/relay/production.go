@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -207,11 +206,18 @@ func helloMatchesAdmission(hello helloMessage, admission connectors.Admission) b
 
 func relayReadyMessage(admission connectors.Admission) []byte {
 	message, _ := json.Marshal(struct {
-		ProtocolVersion int    `json:"protocolVersion"`
-		Type            string `json:"type"`
-		Role            string `json:"role"`
-		KeyID           string `json:"keyId"`
-	}{ProtocolVersion: protocolVersion, Type: "relay.ready", Role: admission.Role, KeyID: admission.Identity.KeyID})
+		ProtocolVersion        int       `json:"protocolVersion"`
+		Type                   string    `json:"type"`
+		Role                   string    `json:"role"`
+		KeyID                  string    `json:"keyId"`
+		AuthorizationExpiresAt time.Time `json:"authorizationExpiresAt"`
+	}{
+		ProtocolVersion:        protocolVersion,
+		Type:                   "relay.ready",
+		Role:                   admission.Role,
+		KeyID:                  admission.Identity.KeyID,
+		AuthorizationExpiresAt: admission.AuthorizationExpiresAt,
+	})
 	return message
 }
 
@@ -295,31 +301,42 @@ func newSecureHub() *secureHub { return &secureHub{peers: make(map[string]*secur
 
 func securePeerID(userID, keyID string) string { return userID + ":" + keyID }
 
+// register admits connected, replacing any existing connection already
+// registered for the same identity. A same-identity replacement happens when
+// a peer proactively renews its relay admission ahead of its authorization
+// lease expiring (see Handler.ServeHTTP's authorizationTimer): the new
+// connection has independently passed the same ticket-consumption and
+// identity checks as any other connection, so evicting the old one here
+// never crosses accounts or bypasses authentication. The evicted peer's own
+// serve loop unwinds through its normal stop()/unregister path; unregister's
+// stale-write guard (hub.peers[id] != connected) makes that a no-op once
+// this function has already installed the replacement, so no spurious
+// offline event reaches other peers and the new registration is untouched.
 func (hub *secureHub) register(connected *securePeer) error {
 	hub.mutex.Lock()
 	id := securePeerID(connected.userID, connected.keyID)
-	if _, exists := hub.peers[id]; exists {
-		hub.mutex.Unlock()
-		return errors.New("identity is already connected")
-	}
+	existing := hub.peers[id]
 	hub.peers[id] = connected
 	var recipients []*securePeer
 	var messages [][]byte
-	for _, existing := range hub.peers {
-		if existing == connected || existing.userID != connected.userID || existing.role == connected.role {
+	for _, peer := range hub.peers {
+		if peer == connected || peer.userID != connected.userID || peer.role == connected.role {
 			continue
 		}
-		if _, trusted := existing.trusted[connected.keyID]; !trusted {
+		if _, trusted := peer.trusted[connected.keyID]; !trusted {
 			continue
 		}
-		if _, trusted := connected.trusted[existing.keyID]; !trusted {
+		if _, trusted := connected.trusted[peer.keyID]; !trusted {
 			continue
 		}
 		// Whichever side just (re)connected, tell it about the other and vice versa.
-		recipients, messages = append(recipients, existing), append(messages, connected.hello)
-		recipients, messages = append(recipients, connected), append(messages, existing.hello)
+		recipients, messages = append(recipients, peer), append(messages, connected.hello)
+		recipients, messages = append(recipients, connected), append(messages, peer.hello)
 	}
 	hub.mutex.Unlock()
+	if existing != nil {
+		existing.stop()
+	}
 	for index, recipient := range recipients {
 		recipient.enqueue(messages[index])
 	}

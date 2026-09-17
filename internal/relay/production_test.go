@@ -107,6 +107,28 @@ func TestProductionRelayClosesAtAuthorizationLeaseExpiry(t *testing.T) {
 	}
 }
 
+func TestRelayReadyMessageCarriesAuthorizationExpiry(t *testing.T) {
+	expiresAt := time.Now().Add(5 * time.Minute).Truncate(time.Millisecond)
+	message := relayReadyMessage(connectors.Admission{
+		Role:                   connectors.RelayRoleClient,
+		Identity:               connectors.PublicIdentity{KeyID: "client"},
+		AuthorizationExpiresAt: expiresAt,
+	})
+	var decoded struct {
+		Type                   string    `json:"type"`
+		AuthorizationExpiresAt time.Time `json:"authorizationExpiresAt"`
+	}
+	if err := json.Unmarshal(message, &decoded); err != nil {
+		t.Fatalf("decode relay.ready: %v", err)
+	}
+	if decoded.Type != "relay.ready" {
+		t.Fatalf("expected type relay.ready, got %q", decoded.Type)
+	}
+	if !decoded.AuthorizationExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expected authorizationExpiresAt %v, got %v", expiresAt, decoded.AuthorizationExpiresAt)
+	}
+}
+
 func TestSecureHubRegisterNotifiesConnectorOfClientPresence(t *testing.T) {
 	connectorPeer := &securePeer{
 		userID: "usr_test", role: connectors.RelayRoleConnector, keyID: "connector",
@@ -202,6 +224,77 @@ func TestSecureHubUnregisterNotifiesConnectorOfClientOffline(t *testing.T) {
 		}
 	default:
 		t.Fatal("connector did not receive client offline notice")
+	}
+}
+
+func TestSecureHubRegisterReplacesSameIdentityConnection(t *testing.T) {
+	connectorPeer := &securePeer{
+		userID: "usr_test", role: connectors.RelayRoleConnector, keyID: "connector",
+		hello:   []byte(`{"type":"connector.hello"}`),
+		trusted: map[string]struct{}{"client": {}}, send: make(chan []byte, 4), done: make(chan struct{}),
+	}
+	oldClientPeer := &securePeer{
+		userID: "usr_test", role: connectors.RelayRoleClient, keyID: "client",
+		hello:   []byte(`{"type":"client.hello","generation":"old"}`),
+		trusted: map[string]struct{}{"connector": {}}, send: make(chan []byte, 4), done: make(chan struct{}),
+	}
+	newClientPeer := &securePeer{
+		userID: "usr_test", role: connectors.RelayRoleClient, keyID: "client",
+		hello:   []byte(`{"type":"client.hello","generation":"new"}`),
+		trusted: map[string]struct{}{"connector": {}}, send: make(chan []byte, 4), done: make(chan struct{}),
+	}
+	hub := newSecureHub()
+	if err := hub.register(connectorPeer); err != nil {
+		t.Fatalf("register connector: %v", err)
+	}
+	if err := hub.register(oldClientPeer); err != nil {
+		t.Fatalf("register old client: %v", err)
+	}
+	<-connectorPeer.send // discard the old client's presence message from register
+
+	// A proactive renewal registers a new connection for the same identity
+	// before the old one has unregistered.
+	if err := hub.register(newClientPeer); err != nil {
+		t.Fatalf("register renewed client: %v", err)
+	}
+	<-connectorPeer.send // discard the renewed client's presence message from register
+	<-newClientPeer.send // discard the connector's presence message from register
+
+	select {
+	case <-oldClientPeer.done:
+	default:
+		t.Fatal("registering a replacement did not stop the superseded connection")
+	}
+
+	if hub.peers[securePeerID("usr_test", "client")] != newClientPeer {
+		t.Fatal("the renewed connection did not take over the identity's registration")
+	}
+
+	if !hub.route(connectorPeer, "client", []byte("frame")) {
+		t.Fatal("routing to the identity failed right after a renewal swap")
+	}
+	select {
+	case message := <-newClientPeer.send:
+		if string(message) != "frame" {
+			t.Fatalf("expected the renewed connection to receive the routed frame, got %s", message)
+		}
+	default:
+		t.Fatal("the renewed connection did not receive the frame routed to its identity")
+	}
+
+	// The superseded connection's own teardown (its serve loop unwinding
+	// after stop()) must not emit a spurious offline notice or clobber the
+	// replacement -- simulate that here via the same unregister call its
+	// deferred cleanup would make.
+	hub.unregister(oldClientPeer)
+
+	select {
+	case message := <-connectorPeer.send:
+		t.Fatalf("superseded connection's teardown emitted an unexpected message: %s", message)
+	default:
+	}
+	if hub.peers[securePeerID("usr_test", "client")] != newClientPeer {
+		t.Fatal("the superseded connection's teardown clobbered the renewed registration")
 	}
 }
 
