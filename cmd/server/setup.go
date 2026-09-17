@@ -42,10 +42,25 @@ type Services struct {
 	Connectors *connectors.Service
 }
 
-// setupMailer selects the logging mailer only when there is no SMTP host to use.
-// The configuration loader requires a host in production, so that fallback is
-// reachable in development alone.
+// setupMailer prefers Mailgun's HTTPS API when MAILGUN_API_KEY is configured: it
+// isn't affected by a host or network that blocks outbound SMTP ports, a common
+// cloud-provider default (see docs/adr/0010-mailgun-http-mailer.md). It falls back
+// to SMTP, then to the logging mailer only when neither is configured — the
+// configuration loader requires one or the other in production, so that fallback
+// is reachable in development alone.
 func setupMailer(config Config, logger *slog.Logger) (identity.Mailer, error) {
+	if config.Mailgun.APIKey != "" {
+		mailer, err := identity.NewMailgunMailer(identity.MailgunMailerConfig{
+			APIKey:      config.Mailgun.APIKey,
+			Domain:      config.Mailgun.Domain,
+			FromAddress: config.Mailgun.FromAddress,
+			Region:      config.Mailgun.Region,
+		})
+		if err != nil {
+			return nil, errors.New("mailer initialization failed")
+		}
+		return mailer, nil
+	}
 	if config.SMTP.Host == "" {
 		return identity.NewLoggingMailer(logger), nil
 	}

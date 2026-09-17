@@ -16,6 +16,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"ENABLE_INSECURE_DEVELOPMENT_RELAY", "REGISTRATION_ENABLED",
 		"SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
 		"SMTP_FROM_ADDRESS", "SMTP_TLS_MODE",
+		"MAILGUN_API_KEY", "MAILGUN_DOMAIN", "MAILGUN_FROM_ADDRESS", "MAILGUN_REGION",
 	} {
 		t.Setenv(key, "")
 	}
@@ -53,6 +54,10 @@ func TestLoadConfigDevelopmentDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("SMTP_PORT", "465")
 	t.Setenv("SMTP_FROM_ADDRESS", " no-reply@example.test ")
 	t.Setenv("SMTP_TLS_MODE", "tls")
+	t.Setenv("MAILGUN_API_KEY", " key-123 ")
+	t.Setenv("MAILGUN_DOMAIN", " mg.example.test ")
+	t.Setenv("MAILGUN_FROM_ADDRESS", " no-reply@example.test ")
+	t.Setenv("MAILGUN_REGION", " eu ")
 	updated, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +71,10 @@ func TestLoadConfigDevelopmentDefaultsAndOverrides(t *testing.T) {
 	if updated.SMTP.Host != "mail.example.test" || updated.SMTP.Port != 465 ||
 		updated.SMTP.FromAddress != "no-reply@example.test" || updated.SMTP.TLSMode != identity.TLSModeImplicit {
 		t.Fatalf("mail overrides were not applied: %#v", updated.SMTP)
+	}
+	if updated.Mailgun.APIKey != " key-123 " || updated.Mailgun.Domain != "mg.example.test" ||
+		updated.Mailgun.FromAddress != "no-reply@example.test" || updated.Mailgun.Region != "eu" {
+		t.Fatalf("mailgun overrides were not applied: %#v", updated.Mailgun)
 	}
 	if config.HTTPAddress != defaultHTTPAddress || config.InsecureDevelopmentCookies {
 		t.Fatal("configuration snapshot changed after loading")
@@ -109,6 +118,16 @@ func TestLoadConfigProductionFailsClosed(t *testing.T) {
 		{name: "plaintext mail", env: map[string]string{"SMTP_TLS_MODE": "none"}, wantError: "SMTP_TLS_MODE"},
 		{name: "unknown mail TLS mode", env: map[string]string{"SMTP_TLS_MODE": "sometimes"}, wantError: "SMTP_TLS_MODE"},
 		{name: "invalid mail port", env: map[string]string{"SMTP_PORT": "70000"}, wantError: "SMTP_PORT"},
+		{name: "mailgun alone satisfies production", env: map[string]string{
+			"SMTP_HOST": "", "SMTP_FROM_ADDRESS": "",
+			"MAILGUN_API_KEY": "key", "MAILGUN_DOMAIN": "mg.example.test",
+			"MAILGUN_FROM_ADDRESS": "no-reply@example.test",
+		}},
+		{name: "mailgun partial configuration", env: map[string]string{"MAILGUN_API_KEY": "key"}, wantError: "MAILGUN_DOMAIN"},
+		{name: "mailgun unknown region", env: map[string]string{
+			"MAILGUN_API_KEY": "key", "MAILGUN_DOMAIN": "mg.example.test",
+			"MAILGUN_FROM_ADDRESS": "no-reply@example.test", "MAILGUN_REGION": "asia",
+		}, wantError: "MAILGUN_REGION"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clearConfigEnvironment(t)

@@ -39,6 +39,7 @@ type Config struct {
 	// registration is verified by email, so it defaults on in every environment.
 	RegistrationEnabled bool
 	SMTP                SMTPConfig
+	Mailgun             MailgunConfig
 	// GoogleAudiences holds the OAuth client IDs a Google ID token may be addressed
 	// to — normally one per mobile platform plus the web client ID those platforms
 	// request server tokens for. Empty disables Google sign-in entirely, which is the
@@ -57,6 +58,17 @@ type SMTPConfig struct {
 	Password    string
 	FromAddress string
 	TLSMode     string
+}
+
+// MailgunConfig configures MailgunMailer, an alternative to SMTPConfig that talks
+// to Mailgun's HTTPS API instead of an SMTP relay. It exists because outbound SMTP
+// ports are commonly blocked by default on cloud hosts; see
+// docs/adr/0010-mailgun-http-mailer.md. An empty APIKey leaves it unconfigured.
+type MailgunConfig struct {
+	APIKey      string
+	Domain      string
+	FromAddress string
+	Region      string
 }
 
 func LoadConfig() (Config, error) {
@@ -94,6 +106,12 @@ func LoadConfig() (Config, error) {
 			Password:    settings.GetString("SMTP_PASSWORD"),
 			FromAddress: strings.TrimSpace(settings.GetString("SMTP_FROM_ADDRESS")),
 			TLSMode:     strings.TrimSpace(settings.GetString("SMTP_TLS_MODE")),
+		},
+		Mailgun: MailgunConfig{
+			APIKey:      settings.GetString("MAILGUN_API_KEY"),
+			Domain:      strings.TrimSpace(settings.GetString("MAILGUN_DOMAIN")),
+			FromAddress: strings.TrimSpace(settings.GetString("MAILGUN_FROM_ADDRESS")),
+			Region:      strings.TrimSpace(settings.GetString("MAILGUN_REGION")),
 		},
 	}
 	var err error
@@ -139,7 +157,7 @@ func LoadConfig() (Config, error) {
 	if !development && (config.InsecureDevelopmentCookies || config.DevelopmentRelayEnabled) {
 		return Config{}, errors.New("insecure development features require APP_ENV=development")
 	}
-	if err := validateSMTP(&config.SMTP, development); err != nil {
+	if err := validateMail(&config.SMTP, &config.Mailgun, development); err != nil {
 		return Config{}, err
 	}
 	config.TrustedProxies, err = parseNetworks(settings.GetString("TRUSTED_PROXY_CIDRS"))
@@ -176,15 +194,20 @@ func booleanSetting(settings *viper.Viper, name string) (bool, error) {
 	return parsed, nil
 }
 
-// validateSMTP fails closed in production the way PAIRING_CODE_KEY does: mail is
-// the only way an account can be activated there, and plaintext submission would
-// put verification codes on the wire. Development may leave it unset entirely,
-// which selects the mailer that logs codes.
-func validateSMTP(config *SMTPConfig, development bool) error {
-	if config.Port <= 0 || config.Port > 65535 {
+// validateMail fails closed in production the way PAIRING_CODE_KEY does: mail is
+// the only way an account can be activated there, and plaintext SMTP submission
+// would put verification codes on the wire. Development may leave both SMTP and
+// Mailgun unset entirely, which selects the mailer that logs codes.
+//
+// SMTP and Mailgun are alternatives, not layers: setupMailer prefers Mailgun's
+// HTTPS API when MAILGUN_API_KEY is set (see docs/adr/0010-mailgun-http-mailer.md),
+// and falls back to SMTP otherwise. Production requires at least one to be fully
+// configured, not both.
+func validateMail(smtp *SMTPConfig, mailgun *MailgunConfig, development bool) error {
+	if smtp.Port <= 0 || smtp.Port > 65535 {
 		return errors.New("SMTP_PORT must be a valid port number")
 	}
-	switch config.TLSMode {
+	switch smtp.TLSMode {
 	case identity.TLSModeStartTLS, identity.TLSModeImplicit:
 	case identity.TLSModeNone:
 		if !development {
@@ -193,11 +216,28 @@ func validateSMTP(config *SMTPConfig, development bool) error {
 	default:
 		return errors.New("SMTP_TLS_MODE must be starttls, tls, or none")
 	}
+
+	// A partially set Mailgun configuration fails closed in every environment: it
+	// is not "unconfigured" the way an entirely empty one is, so silently ignoring
+	// the fragment would hide an operator mistake.
+	mailgunConfigured := mailgun.APIKey != ""
+	if mailgunConfigured {
+		if mailgun.Domain == "" || mailgun.FromAddress == "" {
+			return errors.New("MAILGUN_API_KEY requires MAILGUN_DOMAIN and MAILGUN_FROM_ADDRESS")
+		}
+		switch strings.ToLower(mailgun.Region) {
+		case "", "us", "eu":
+		default:
+			return errors.New("MAILGUN_REGION must be us or eu")
+		}
+	}
+
 	if development {
 		return nil
 	}
-	if config.Host == "" || config.FromAddress == "" {
-		return errors.New("production requires SMTP_HOST and SMTP_FROM_ADDRESS")
+	smtpConfigured := smtp.Host != "" && smtp.FromAddress != ""
+	if !smtpConfigured && !mailgunConfigured {
+		return errors.New("production requires either SMTP_HOST and SMTP_FROM_ADDRESS, or MAILGUN_API_KEY, MAILGUN_DOMAIN, and MAILGUN_FROM_ADDRESS")
 	}
 	return nil
 }

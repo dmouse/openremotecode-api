@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -204,6 +207,76 @@ func TestNewSMTPMailerValidatesConfiguration(t *testing.T) {
 			config := valid
 			mutate(&config)
 			if _, err := NewSMTPMailer(config); err == nil {
+				t.Fatal("invalid configuration was accepted")
+			}
+		})
+	}
+}
+
+// Mailgun's HTTP client has no deadline of its own either, so an unresponsive API
+// endpoint must not be able to hang the request that triggered the send.
+func TestMailgunMailerEnforcesItsDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// net/http only starts watching for a client disconnect once the request body
+		// is fully drained (see (*http.conn).serve / requestBodyRemains); an undrained
+		// body leaves r.Context() never canceled, and httptest.Server.Close waiting for
+		// this handler forever. Draining first is what lets the block below observe the
+		// client's own deadline instead of hanging the test itself.
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	mailer, err := NewMailgunMailer(MailgunMailerConfig{
+		APIKey:      "key",
+		Domain:      "mg.example.test",
+		FromAddress: "no-reply@example.test",
+		Timeout:     250 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("create mailer: %v", err)
+	}
+	mailer.client.SetHTTPClient(server.Client())
+	if err := mailer.client.SetAPIBase(server.URL); err != nil {
+		t.Fatalf("point mailer at test server: %v", err)
+	}
+
+	started := time.Now()
+	err = mailer.SendVerificationCode(context.Background(), "person@example.com", "123456")
+	elapsed := time.Since(started)
+
+	if !errors.Is(err, ErrMailDeliveryFailed) {
+		t.Fatalf("error = %v, want %v", err, ErrMailDeliveryFailed)
+	}
+	if errors.Is(err, ErrMailUndeliverable) {
+		t.Fatal("mailgun's HTTP mailer must never mark the address undeliverable")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("the send took %v, so the deadline was not enforced", elapsed)
+	}
+}
+
+func TestNewMailgunMailerValidatesConfiguration(t *testing.T) {
+	valid := MailgunMailerConfig{
+		APIKey:      "key",
+		Domain:      "mg.example.test",
+		FromAddress: "no-reply@example.test",
+	}
+	if _, err := NewMailgunMailer(valid); err != nil {
+		t.Fatalf("valid configuration rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*MailgunMailerConfig){
+		"no api key":                func(config *MailgunMailerConfig) { config.APIKey = " " },
+		"no domain":                 func(config *MailgunMailerConfig) { config.Domain = " " },
+		"no sender":                 func(config *MailgunMailerConfig) { config.FromAddress = "" },
+		"sender without an at sign": func(config *MailgunMailerConfig) { config.FromAddress = "no-reply" },
+		"unknown region":            func(config *MailgunMailerConfig) { config.Region = "asia" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := valid
+			mutate(&config)
+			if _, err := NewMailgunMailer(config); err == nil {
 				t.Fatal("invalid configuration was accepted")
 			}
 		})
