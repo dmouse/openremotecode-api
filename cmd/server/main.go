@@ -28,18 +28,18 @@ func start(logger *slog.Logger) error {
 		return err
 	}
 
-	db, pool, err := SetupDatabase(ctx, config)
+	databases, err := SetupDatabase(ctx, config)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
+	defer databases.Close()
 
-	services, err := SetupServices(ctx, db, config, logger)
+	services, err := SetupServices(ctx, databases, config, logger)
 	if err != nil {
 		return err
 	}
 
-	router, closeRelay := RegisterRoutes(config, services, pool, logger)
+	router, closeRelay := RegisterRoutes(config, services, databases.Health, logger)
 	defer closeRelay()
 
 	return Run(ctx, config, router, logger)

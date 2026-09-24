@@ -119,7 +119,10 @@ func TestPersistentPairingAndSingleUseTickets(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatalf("create user: %v", err)
 	}
+	// Wired as cmd/server wires it: committed revocations close live sockets through the hub.
+	relayHub := relay.NewHub()
 	service, err := connectors.NewService(connectorspostgres.NewStore(databaseConnection), connectors.ServiceOptions{
+		OnRevoked:       func(revocation connectors.Revocation) { relayHub.Disconnect(revocation) },
 		Now:             func() time.Time { return now },
 		PairingCodeKey:  []byte("integration-pairing-code-key-at-least-32-bytes"),
 		ServiceID:       "integration",
@@ -190,6 +193,28 @@ func TestPersistentPairingAndSingleUseTickets(t *testing.T) {
 	}
 
 	deviceIdentity, deviceKey := generateIdentity(t)
+	// A wrong code is reported as such, spends its challenge, and is counted in PostgreSQL.
+	wrongChallenge, err := service.IssueChallenge(ctx, connectors.ChallengePurposeDevice, &userID)
+	if err != nil {
+		t.Fatalf("issue device challenge for a wrong code: %v", err)
+	}
+	wrongProof := signProof(t, deviceKey, deviceIdentity, wrongChallenge.Challenge)
+	wrongInput := connectors.ClaimPairingInput{UserID: userID, UserCode: "ZZZZ-ZZZZ", DeviceName: "Integration browser",
+		Identity: deviceIdentity, Proof: wrongProof}
+	if _, err := service.ClaimPairing(ctx, wrongInput); !errors.Is(err, connectors.ErrInvalidCode) {
+		t.Fatalf("wrong code = %v, want ErrInvalidCode", err)
+	}
+	wrongInput.UserCode = pairing.UserCode
+	if _, err := service.ClaimPairing(ctx, wrongInput); !errors.Is(err, connectors.ErrUnauthorized) {
+		t.Fatalf("a challenge spent on a wrong code was accepted again: %v", err)
+	}
+	var recordedFailures int64
+	if err := databaseConnection.Model(&connectorspostgres.ClaimFailureModel{}).Where("user_id = ?", userID).Count(&recordedFailures).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recordedFailures != 1 {
+		t.Fatalf("recorded claim failures = %d, want 1", recordedFailures)
+	}
 	deviceChallenge, err := service.IssueChallenge(ctx, connectors.ChallengePurposeDevice, &userID)
 	if err != nil {
 		t.Fatalf("issue device challenge: %v", err)
@@ -211,6 +236,18 @@ func TestPersistentPairingAndSingleUseTickets(t *testing.T) {
 	poll, err := service.PollPairing(ctx, pairing.PairingSecret)
 	if err != nil || poll.Status != connectors.PairingStateVerification || poll.Transcript == nil {
 		t.Fatalf("poll verification state: result=%#v err=%v", poll, err)
+	}
+	// Seeing the transcript is not consent: confirmation still needs the approval given in
+	// OpenCode, and that approval is bound to the device the connector was shown.
+	if _, err := service.ConfirmPairing(ctx, userID, pairing.PairingID, claim.DeviceID); !errors.Is(err, connectors.ErrConflict) {
+		t.Fatalf("confirmation before connector approval must fail, got %v", err)
+	}
+	otherIdentity, _ := generateIdentity(t)
+	if err := service.ApprovePairing(ctx, pairing.PairingID, pairing.PairingSecret, otherIdentity.KeyID); !errors.Is(err, connectors.ErrConflict) {
+		t.Fatalf("approval of a device the connector was not shown must fail, got %v", err)
+	}
+	if err := service.ApprovePairing(ctx, pairing.PairingID, pairing.PairingSecret, poll.Transcript.DeviceIdentity.KeyID); err != nil {
+		t.Fatalf("approve pairing: %v", err)
 	}
 	if err := databaseConnection.Model(&identitypostgres.UserModel{}).Where("id = ?", userID).Update("status", "disabled").Error; err != nil {
 		t.Fatalf("disable account before confirmation: %v", err)
@@ -327,6 +364,77 @@ func TestPersistentPairingAndSingleUseTickets(t *testing.T) {
 		t.Fatalf("repeat connector migration with populated schema: %v", err)
 	}
 
+	// Revoke the paired client device from the account: its live admission, unused tickets,
+	// credential, inventory entry and trust must all end, and the connector must stop
+	// receiving its identity, while the connector itself stays authorized.
+	devices, err := service.ListDevices(ctx, userID)
+	if err != nil || len(devices) != 1 || devices[0].ID != claim.DeviceID {
+		t.Fatalf("device inventory before revocation: %v", err)
+	}
+	if err := service.ValidateAdmission(ctx, browserAdmission); err != nil {
+		t.Fatalf("live client admission rejected before revocation: %v", err)
+	}
+	unusedBrowserTicket, err := service.IssueBrowserTicket(ctx, userID, "asn_integration_session_01", claim.DeviceID, confirmed.DeviceCredential, now.Add(15*time.Minute))
+	if err != nil {
+		t.Fatalf("issue browser ticket before device revocation: %v", err)
+	}
+	// A real, active second account: its request passes the account check and must then
+	// fail on ownership, indistinguishably from a device that does not exist.
+	foreignUserID := "usr_pairing_integration_02"
+	if err := databaseConnection.Create(&identitypostgres.UserModel{
+		ID: foreignUserID, Email: "foreign@example.test", NormalizedEmail: "foreign@example.test",
+		PasswordHash: stringPointer("not-used"), Status: "active", CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("create foreign user: %v", err)
+	}
+	if err := service.RevokeAccountDevice(ctx, foreignUserID, claim.DeviceID); !errors.Is(err, connectors.ErrNotFound) {
+		t.Fatalf("foreign account revoked the device: %v", err)
+	}
+	for range 2 {
+		if err := service.RevokeAccountDevice(ctx, userID, claim.DeviceID); err != nil {
+			t.Fatalf("revoke device: %v", err)
+		}
+	}
+	if err := service.ValidateAdmission(ctx, browserAdmission); !errors.Is(err, connectors.ErrUnauthorized) {
+		t.Fatalf("revoked device kept its live admission: %v", err)
+	}
+	if _, err := service.ConsumeRelayTicket(ctx, unusedBrowserTicket.Ticket); !errors.Is(err, connectors.ErrUnauthorized) {
+		t.Fatalf("pre-revocation device ticket accepted: %v", err)
+	}
+	if _, err := service.IssueBrowserTicket(ctx, userID, "asn_integration_session_01", claim.DeviceID, confirmed.DeviceCredential, now.Add(15*time.Minute)); !errors.Is(err, connectors.ErrUnauthorized) {
+		t.Fatalf("revoked device issued a ticket: %v", err)
+	}
+	if devices, err := service.ListDevices(ctx, userID); err != nil || len(devices) != 0 {
+		t.Fatalf("revoked device remains visible: %v", err)
+	}
+	var activeTrust int64
+	if err := databaseConnection.Model(&connectorspostgres.TrustModel{}).
+		Where("device_id = ? AND revoked_at IS NULL", claim.DeviceID).Count(&activeTrust).Error; err != nil {
+		t.Fatal(err)
+	}
+	if activeTrust != 0 {
+		t.Fatalf("revoked device kept %d active trust rows", activeTrust)
+	}
+	if err := service.ValidateAdmission(ctx, connectorAdmission); err != nil {
+		t.Fatalf("device revocation affected the connector: %v", err)
+	}
+	postRevocationTicket, err := service.IssueConnectorTicket(ctx, completed.ConnectorCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postRevocationAdmission, err := service.ConsumeRelayTicket(ctx, postRevocationTicket.Ticket)
+	if err != nil || len(postRevocationAdmission.TrustedIdentities) != 0 {
+		t.Fatalf("connector still trusts the revoked device: admission=%#v err=%v", postRevocationAdmission, err)
+	}
+	var deviceRevocationAudits int64
+	if err := databaseConnection.Model(&connectorspostgres.AuditEventModel{}).
+		Where("device_id = ? AND event_type = ?", claim.DeviceID, "device.revoked").Count(&deviceRevocationAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	if deviceRevocationAudits != 1 {
+		t.Fatalf("device revocation audit count = %d", deviceRevocationAudits)
+	}
+
 	// Exercise the public revocation API against PostgreSQL and an already connected relay.
 	unusedTicket, err := service.IssueConnectorTicket(ctx, completed.ConnectorCredential)
 	if err != nil {
@@ -336,7 +444,7 @@ func TestPersistentPairingAndSingleUseTickets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relayHandler := relay.NewHandler(service, relay.HandlerConfig{Now: func() time.Time { return now }})
+	relayHandler := relay.NewHandler(service, relay.HandlerConfig{Now: func() time.Time { return now }, Hub: relayHub})
 	connectorHandler := connectorshttp.NewHandler(nil, service, connectorshttp.Config{})
 	router := httpserver.NewRouter(nil)
 	router.GET("/v1/relay", gin.WrapH(relayHandler))
@@ -481,3 +589,126 @@ func withSearchPath(databaseURL, schema string) (string, error) {
 // stringPointer builds an optional column value. users.password_hash is nullable
 // now that federated accounts exist, so fixtures must say which they mean.
 func stringPointer(value string) *string { return &value }
+
+// The store counts and purges claim failures by window, and its per-account advisory lock
+// serializes concurrent claims so they cannot all pass the same count.
+func TestClaimFailureWindowsAndLock(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_TEST_URL")
+	if databaseURL == "" {
+		databaseURL = defaultIntegrationDatabaseURL
+	}
+	adminDatabase, adminSQL, err := database.Open(databaseURL)
+	if err != nil {
+		t.Skipf("PostgreSQL integration database unavailable: %v", err)
+	}
+	defer adminSQL.Close()
+	schema := fmt.Sprintf("claim_failure_test_%d", time.Now().UnixNano())
+	if err := adminDatabase.Exec("CREATE SCHEMA " + schema).Error; err != nil {
+		t.Fatalf("create test schema: %v", err)
+	}
+	defer adminDatabase.Exec("DROP SCHEMA " + schema + " CASCADE")
+	isolatedURL, err := withSearchPath(databaseURL, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databaseConnection, sqlDatabase, err := database.Open(isolatedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDatabase.Close()
+	ctx := context.Background()
+	if err := identitypostgres.Migrate(ctx, databaseConnection); err != nil {
+		t.Fatal(err)
+	}
+	if err := connectorspostgres.Migrate(ctx, databaseConnection); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	for _, id := range []string{"usr_claim_failure_a_0001", "usr_claim_failure_b_0001"} {
+		if err := databaseConnection.Create(&identitypostgres.UserModel{ID: id, Email: id + "@example.test", NormalizedEmail: id + "@example.test",
+			PasswordHash: stringPointer("not-used"), Status: "active", CreatedAt: now}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := connectorspostgres.NewStore(databaseConnection)
+	record := func(userID string, at time.Time) {
+		t.Helper()
+		if err := store.WithinTransaction(ctx, func(transaction connectors.TransactionStore) error {
+			return transaction.RecordClaimFailure(ctx, userID, at, now.Add(-time.Hour))
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts := func(userID string) connectors.ClaimFailureCounts {
+		t.Helper()
+		var result connectors.ClaimFailureCounts
+		if err := store.WithinTransaction(ctx, func(transaction connectors.TransactionStore) error {
+			var countErr error
+			result, countErr = transaction.ClaimFailuresForUpdate(ctx, userID, now.Add(-time.Hour), now.Add(-time.Minute))
+			return countErr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	// Seed one row that is already outside every window, then record fresh ones.
+	if err := databaseConnection.Create(&connectorspostgres.ClaimFailureModel{UserID: "usr_claim_failure_a_0001", OccurredAt: now.Add(-2 * time.Hour)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	record("usr_claim_failure_a_0001", now.Add(-30*time.Minute))
+	record("usr_claim_failure_a_0001", now.Add(-10*time.Second))
+	record("usr_claim_failure_b_0001", now.Add(-20*time.Second))
+
+	a := counts("usr_claim_failure_a_0001")
+	if a.Account != 2 || !a.AccountOldest.Equal(now.Add(-30*time.Minute)) || a.Global != 2 {
+		t.Fatalf("counts for a = %+v, want 2 in the hour from -30m, 2 service-wide in the minute", a)
+	}
+	if b := counts("usr_claim_failure_b_0001"); b.Account != 1 || b.Global != 2 {
+		t.Fatalf("counts for b = %+v", b)
+	}
+	var stored int64
+	if err := databaseConnection.Model(&connectorspostgres.ClaimFailureModel{}).Count(&stored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored != 3 {
+		t.Fatalf("stored failures = %d, want 3 after the expired row was purged", stored)
+	}
+
+	// While one transaction holds the account's lock, another for the same account waits and
+	// one for a different account does not.
+	held := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- store.WithinTransaction(ctx, func(transaction connectors.TransactionStore) error {
+			if _, err := transaction.ClaimFailuresForUpdate(ctx, "usr_claim_failure_a_0001", now.Add(-time.Hour), now.Add(-time.Minute)); err != nil {
+				return err
+			}
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	counts("usr_claim_failure_b_0001") // another account proceeds while a is held
+	waited := make(chan struct{})
+	go func() {
+		counts("usr_claim_failure_a_0001")
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("a second claim for the same account did not wait for the lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting claim never acquired the lock")
+	}
+}

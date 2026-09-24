@@ -24,7 +24,7 @@ func (service fixedAdmissionService) ConsumeRelayTicket(context.Context, string)
 	return service.admission, nil
 }
 
-func (service fixedAdmissionService) ValidateConnectorAdmission(context.Context, connectors.Admission) error {
+func (service fixedAdmissionService) ValidateAdmission(context.Context, connectors.Admission) error {
 	if service.revoked != nil && service.revoked.Load() {
 		return connectors.ErrUnauthorized
 	}
@@ -38,7 +38,7 @@ func TestProductionRelayClosesIdleRevokedConnector(t *testing.T) {
 		UserID: "usr_test", Role: connectors.RelayRoleConnector, SubjectID: "con_test",
 		Identity:               connectors.PublicIdentity{Version: identity.Version, Suite: identity.Suite, KeyID: identity.KeyID, PublicKey: identity.PublicKey},
 		AuthorizationExpiresAt: time.Now().Add(5 * time.Minute),
-	}}, HandlerConfig{})
+	}}, HandlerConfig{RevalidationInterval: 200 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() { handler.Close(); server.Close() })
 	dialer := *websocket.DefaultDialer
@@ -58,6 +58,38 @@ func TestProductionRelayClosesIdleRevokedConnector(t *testing.T) {
 	_ = connection.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, _, err := connection.ReadMessage(); !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		t.Fatalf("expected a server close after revocation, got %v", err)
+	}
+}
+
+// A revoked device, or a client whose session ended, must lose its socket as promptly
+// as a revoked connector does, not at the end of its authorization lease.
+func TestProductionRelayClosesIdleRevokedClient(t *testing.T) {
+	identity := testIdentity(strings.Repeat("d", 43))
+	revoked := &atomic.Bool{}
+	handler := NewHandler(fixedAdmissionService{revoked: revoked, admission: connectors.Admission{
+		UserID: "usr_test", Role: connectors.RelayRoleClient, SubjectID: "dev_test", SessionID: "asn_test",
+		Identity:               connectors.PublicIdentity{Version: identity.Version, Suite: identity.Suite, KeyID: identity.KeyID, PublicKey: identity.PublicKey},
+		AuthorizationExpiresAt: time.Now().Add(5 * time.Minute),
+	}}, HandlerConfig{RevalidationInterval: 200 * time.Millisecond})
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() { handler.Close(); server.Close() })
+	dialer := *websocket.DefaultDialer
+	dialer.Subprotocols = []string{relayWebSocketProtocol, "ticket.ort_test"}
+	connection, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := connection.WriteJSON(helloMessage{ProtocolVersion: protocolVersion, Type: "client.hello", Nonce: testNonce(), Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := connection.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	revoked.Store(true)
+	_ = connection.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := connection.ReadMessage(); !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		t.Fatalf("expected a server close after device revocation, got %v", err)
 	}
 }
 

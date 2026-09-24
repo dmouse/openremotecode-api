@@ -13,6 +13,14 @@ type revocationStore struct {
 	TransactionStore
 	connectors map[string]Connector
 	devices    map[string]Device
+	pairings   map[string]Pairing
+	challenges map[string]Challenge
+	failures   []claimFailure
+	trusts     []Trust
+	// revokedTrust records the device IDs whose trust rows were revoked.
+	revokedTrust []string
+	// announced records the revocations the service reported after committing.
+	announced  []Revocation
 	audits     []AuditEvent
 	auditError error
 }
@@ -57,6 +65,15 @@ func (repository revocationRepository) WithinTransaction(_ context.Context, oper
 	for id, connector := range repository.store.connectors {
 		copy.connectors[id] = connector
 	}
+	copy.challenges = make(map[string]Challenge)
+	for hash, challenge := range repository.store.challenges {
+		copy.challenges[hash] = challenge
+	}
+	copy.failures = append([]claimFailure(nil), repository.store.failures...)
+	copy.pairings = make(map[string]Pairing)
+	for id, pairing := range repository.store.pairings {
+		copy.pairings[id] = pairing
+	}
 	copy.devices = make(map[string]Device)
 	for id, device := range repository.store.devices {
 		copy.devices[id] = device
@@ -77,14 +94,15 @@ func revocationFixture() (*Service, *revocationStore, string, Admission) {
 		"con_a": connector,
 		"con_b": {ID: "con_b", UserID: "usr_b", CredentialHash: hashSecret("orc_" + strings.Repeat("B", 43)), CredentialExpiresAt: &expires},
 	}}
-	service := &Service{repository: revocationRepository{store: store}, now: func() time.Time { return now }, authorizeAccount: func(context.Context, string) error { return nil }}
+	service := &Service{repository: revocationRepository{store: store}, now: func() time.Time { return now }, authorizeAccount: func(context.Context, string) error { return nil },
+		onRevoked: func(revocation Revocation) { store.announced = append(store.announced, revocation) }}
 	return service, store, credential, Admission{Role: RelayRoleConnector, UserID: connector.UserID, SubjectID: connector.ID, Identity: connector.Identity}
 }
 
 func TestRevokeConnectorIsScopedIdempotentAndInvalidatesAdmission(t *testing.T) {
 	service, store, credential, admission := revocationFixture()
 	ctx := context.Background()
-	if err := service.ValidateConnectorAdmission(ctx, admission); err != nil {
+	if err := service.ValidateAdmission(ctx, admission); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
@@ -98,8 +116,16 @@ func TestRevokeConnectorIsScopedIdempotentAndInvalidatesAdmission(t *testing.T) 
 	if len(store.audits) != 1 || store.audits[0].EventType != "connector.revoked" || *store.audits[0].UserID != "usr_a" || *store.audits[0].ConnectorID != "con_a" {
 		t.Fatal("missing or duplicated scoped audit")
 	}
-	if err := service.ValidateConnectorAdmission(ctx, admission); !errors.Is(err, ErrUnauthorized) {
+	if err := service.ValidateAdmission(ctx, admission); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("revoked admission accepted: %v", err)
+	}
+	for _, revocation := range store.announced {
+		if revocation != (Revocation{UserID: "usr_a", ConnectorID: "con_a"}) {
+			t.Fatalf("announced %+v, want the revoked connector", revocation)
+		}
+	}
+	if len(store.announced) == 0 {
+		t.Fatal("a committed revocation was not announced, so live sockets would stay open")
 	}
 }
 
@@ -132,6 +158,9 @@ func TestRevocationRollsBackWhenAuditFails(t *testing.T) {
 	if store.connectors["con_a"].RevokedAt != nil {
 		t.Fatal("revocation committed without its audit event")
 	}
+	if len(store.announced) != 0 {
+		t.Fatal("a revocation that rolled back was announced")
+	}
 }
 
 func TestAccountRevocationChecksOwnershipAndInvalidatesAdmission(t *testing.T) {
@@ -153,7 +182,7 @@ func TestAccountRevocationChecksOwnershipAndInvalidatesAdmission(t *testing.T) {
 	if len(store.audits) != 1 || store.connectors["con_a"].RevokedAt == nil {
 		t.Fatal("revocation must be durable and idempotent")
 	}
-	if err := service.ValidateConnectorAdmission(ctx, admission); !errors.Is(err, ErrUnauthorized) {
+	if err := service.ValidateAdmission(ctx, admission); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("revoked connector still admitted: %v", err)
 	}
 }
@@ -210,7 +239,7 @@ func TestAccountRenamePreservesTrustAndPersistsOnlyForOwner(t *testing.T) {
 	if len(store.audits) != 1 || store.audits[0].EventType != "connector.renamed" {
 		t.Fatal("missing or duplicated audit")
 	}
-	if err := service.ValidateConnectorAdmission(ctx, admission); err != nil {
+	if err := service.ValidateAdmission(ctx, admission); err != nil {
 		t.Fatal("rename broke existing admission")
 	}
 	store.auditError = errors.New("audit unavailable")
@@ -239,7 +268,7 @@ func TestConnectorAdmissionRejectsMismatchedAccountAndIdentity(t *testing.T) {
 	} {
 		candidate := admission
 		modify(&candidate)
-		if err := service.ValidateConnectorAdmission(context.Background(), candidate); !errors.Is(err, ErrUnauthorized) {
+		if err := service.ValidateAdmission(context.Background(), candidate); !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("mismatched admission accepted: %v", err)
 		}
 	}

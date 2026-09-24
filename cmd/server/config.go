@@ -40,6 +40,7 @@ type Config struct {
 	RegistrationEnabled bool
 	SMTP                SMTPConfig
 	Mailgun             MailgunConfig
+	DisposableEmail     DisposableEmailConfig
 	// GoogleAudiences holds the OAuth client IDs a Google ID token may be addressed
 	// to — normally one per mobile platform plus the web client ID those platforms
 	// request server tokens for. Empty disables Google sign-in entirely, which is the
@@ -76,6 +77,24 @@ type MailgunConfig struct {
 	Region      string
 }
 
+// DisposableEmailConfig controls the throwaway-address filter on registration. It is a
+// spam control, not a security boundary, so it is on by default in production and off
+// in development, where the upstream list's inclusion of example.com would reject the
+// addresses every test and demo uses. See docs/adr/0016-disposable-email-filter.md.
+type DisposableEmailConfig struct {
+	Enabled bool
+	// CacheDir must be writable. The production container's root filesystem is
+	// read-only, so its compose file mounts a tmpfs here. Empty selects the library's
+	// default under the user cache directory.
+	CacheDir string
+	// DataURL replaces the upstream release feed, letting a deployment self-host a
+	// reviewed copy of the list. Empty selects upstream.
+	DataURL string
+	// AllowDomains are exempt from the filter, subdomains included: the remedy for a
+	// false positive that does not wait for an upstream list update.
+	AllowDomains []string
+}
+
 func LoadConfig() (Config, error) {
 	settings := viper.New()
 	settings.SetDefault("HTTP_ADDR", defaultHTTPAddress)
@@ -89,6 +108,7 @@ func LoadConfig() (Config, error) {
 	settings.AutomaticEnv()
 
 	development := settings.GetString("APP_ENV") == "development"
+	settings.SetDefault("DISPOSABLE_EMAIL_FILTER", strconv.FormatBool(!development))
 	if development {
 		settings.SetDefault("PAIRING_CODE_KEY", "local-development-pairing-code-key-change-me")
 		settings.SetDefault("SERVICE_ID", defaultServiceID)
@@ -117,6 +137,11 @@ func LoadConfig() (Config, error) {
 			Domain:      strings.TrimSpace(settings.GetString("MAILGUN_DOMAIN")),
 			FromAddress: strings.TrimSpace(settings.GetString("MAILGUN_FROM_ADDRESS")),
 			Region:      strings.TrimSpace(settings.GetString("MAILGUN_REGION")),
+		},
+		DisposableEmail: DisposableEmailConfig{
+			CacheDir:     strings.TrimSpace(settings.GetString("DISPOSABLE_EMAIL_CACHE_DIR")),
+			DataURL:      strings.TrimSpace(settings.GetString("DISPOSABLE_EMAIL_DATA_URL")),
+			AllowDomains: parseList(settings.GetString("DISPOSABLE_EMAIL_ALLOW_DOMAINS")),
 		},
 	}
 	var err error
@@ -150,6 +175,7 @@ func LoadConfig() (Config, error) {
 		{"INSECURE_DEVELOPMENT_COOKIES", &config.InsecureDevelopmentCookies},
 		{"ENABLE_INSECURE_DEVELOPMENT_RELAY", &config.DevelopmentRelayEnabled},
 		{"REGISTRATION_ENABLED", &config.RegistrationEnabled},
+		{"DISPOSABLE_EMAIL_FILTER", &config.DisposableEmail.Enabled},
 	} {
 		*flag.target, err = booleanSetting(settings, flag.name)
 		if err != nil {
@@ -164,6 +190,9 @@ func LoadConfig() (Config, error) {
 	}
 	if err := validateMail(&config.SMTP, &config.Mailgun, development); err != nil {
 		return Config{}, err
+	}
+	if config.DisposableEmail.DataURL != "" && !validDisposableEmailDataURL(config.DisposableEmail.DataURL, development) {
+		return Config{}, errors.New("DISPOSABLE_EMAIL_DATA_URL must be an HTTPS URL without credentials")
 	}
 	config.TrustedProxies, err = parseNetworks(settings.GetString("TRUSTED_PROXY_CIDRS"))
 	if err != nil {
@@ -251,6 +280,17 @@ func validateMail(smtp *SMTPConfig, mailgun *MailgunConfig, development bool) er
 func validProductionVerificationURI(value string) bool {
 	parsed, err := url.ParseRequestURI(value)
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
+// validDisposableEmailDataURL requires HTTPS outside development because the
+// downloaded list decides who may register, and a plaintext fetch would let anyone on
+// the path rewrite it. Credentials in the URL would end up in this process's logs.
+func validDisposableEmailDataURL(value string, development bool) bool {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return false
+	}
+	return parsed.Scheme == "https" || (development && parsed.Scheme == "http")
 }
 
 func parseNetworks(value string) ([]*net.IPNet, error) {

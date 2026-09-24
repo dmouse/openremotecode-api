@@ -218,7 +218,8 @@ func TestDeviceCredentialKeyIsSeparateFromTheUserCodeKey(t *testing.T) {
 	if bytes.Equal(separate.deviceCredentialKey, separate.pairingCodeKey) {
 		t.Fatal("the device key was not kept separate")
 	}
-	if seeded.deriveDeviceCredential("dkey_a") == separate.deriveDeviceCredential("dkey_a") {
+	seed := bytes.Repeat([]byte{7}, deviceCredentialSeedLength)
+	if seeded.deriveDeviceCredential(seed) == separate.deriveDeviceCredential(seed) {
 		t.Fatal("device credentials did not follow the device key")
 	}
 	if seeded.hashUserCode("ABCD-EFGH") == nil ||

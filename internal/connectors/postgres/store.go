@@ -36,6 +36,21 @@ func (store *Store) ListConnectors(ctx context.Context, userID string) ([]connec
 	return result, nil
 }
 
+func (store *Store) ListDevices(ctx context.Context, userID string) ([]connectors.Device, error) {
+	var models []DeviceModel
+	err := store.database.WithContext(ctx).
+		Where("user_id = ? AND activated_at IS NOT NULL AND revoked_at IS NULL", userID).
+		Order("created_at ASC").Find(&models).Error
+	if err != nil {
+		return nil, translateError(err)
+	}
+	result := make([]connectors.Device, 0, len(models))
+	for _, model := range models {
+		result = append(result, deviceFromModel(model))
+	}
+	return result, nil
+}
+
 type transactionStore struct{ database *gorm.DB }
 
 func (store *transactionStore) CreateChallenge(ctx context.Context, value connectors.Challenge) error {
@@ -171,6 +186,13 @@ func (store *transactionStore) SaveConnector(ctx context.Context, value connecto
 	return save(ctx, store.database, connectorModel(value))
 }
 
+func (store *transactionStore) RevokeDeviceTrust(ctx context.Context, userID, deviceID string, revokedAt time.Time) error {
+	return translateError(store.database.WithContext(ctx).
+		Model(&TrustModel{}).
+		Where("user_id = ? AND device_id = ? AND revoked_at IS NULL", userID, deviceID).
+		Update("revoked_at", revokedAt).Error)
+}
+
 func (store *transactionStore) UpsertTrust(ctx context.Context, value connectors.Trust) error {
 	model := trustModel(value)
 	return translateError(store.database.WithContext(ctx).Omit(clause.Associations).Clauses(clause.OnConflict{
@@ -205,6 +227,44 @@ func (store *transactionStore) TrustedIdentities(ctx context.Context, userID, ro
 		result = append(result, connectors.PublicIdentity{Version: row.Version, Suite: row.Suite, KeyID: row.KeyID, PublicKey: row.PublicKey})
 	}
 	return result, nil
+}
+
+func (store *transactionStore) ClaimFailuresForUpdate(ctx context.Context, userID string, accountSince, globalSince time.Time) (connectors.ClaimFailureCounts, error) {
+	// A transaction-scoped advisory lock per account: a row lock is not available because
+	// the account row belongs to the identity module, and nothing else needs this key.
+	if err := store.database.WithContext(ctx).
+		Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", "pairing-claim:"+userID).Error; err != nil {
+		return connectors.ClaimFailureCounts{}, translateError(err)
+	}
+	var account struct {
+		Count  int
+		Oldest *time.Time
+	}
+	if err := store.database.WithContext(ctx).Model(&ClaimFailureModel{}).
+		Select("count(*) AS count, min(occurred_at) AS oldest").
+		Where("user_id = ? AND occurred_at > ?", userID, accountSince).
+		Scan(&account).Error; err != nil {
+		return connectors.ClaimFailureCounts{}, translateError(err)
+	}
+	var global int64
+	if err := store.database.WithContext(ctx).Model(&ClaimFailureModel{}).
+		Where("occurred_at > ?", globalSince).Count(&global).Error; err != nil {
+		return connectors.ClaimFailureCounts{}, translateError(err)
+	}
+	counts := connectors.ClaimFailureCounts{Account: account.Count, Global: int(global)}
+	if account.Oldest != nil {
+		counts.AccountOldest = *account.Oldest
+	}
+	return counts, nil
+}
+
+func (store *transactionStore) RecordClaimFailure(ctx context.Context, userID string, occurredAt, purgeBefore time.Time) error {
+	if err := store.database.WithContext(ctx).
+		Where("occurred_at <= ?", purgeBefore).Delete(&ClaimFailureModel{}).Error; err != nil {
+		return translateError(err)
+	}
+	return translateError(store.database.WithContext(ctx).Omit(clause.Associations).
+		Create(&ClaimFailureModel{UserID: userID, OccurredAt: occurredAt}).Error)
 }
 
 func (store *transactionStore) CreateRelayTicket(ctx context.Context, value connectors.RelayTicket) error {
@@ -261,10 +321,10 @@ func connectorFromModel(value ConnectorModel) connectors.Connector {
 }
 
 func pairingModel(value connectors.Pairing) *PairingModel {
-	return &PairingModel{ID: value.ID, SecretHash: value.SecretHash, UserCodeHash: value.UserCodeHash, ConnectorName: value.ConnectorName, ConnectorIdentityVersion: value.ConnectorIdentity.Version, ConnectorIdentitySuite: value.ConnectorIdentity.Suite, ConnectorKeyID: value.ConnectorIdentity.KeyID, ConnectorPublicKey: value.ConnectorIdentity.PublicKey, ConnectorCredentialHash: value.ConnectorCredentialHash, State: value.State, UserID: value.UserID, DeviceID: value.DeviceID, ConnectorID: value.ConnectorID, CreatedAt: value.CreatedAt, ExpiresAt: value.ExpiresAt, ConnectorReviewedAt: value.ConnectorReviewedAt, ConfirmedAt: value.ConfirmedAt, CompletedAt: value.CompletedAt}
+	return &PairingModel{ID: value.ID, SecretHash: value.SecretHash, UserCodeHash: value.UserCodeHash, ConnectorName: value.ConnectorName, ConnectorIdentityVersion: value.ConnectorIdentity.Version, ConnectorIdentitySuite: value.ConnectorIdentity.Suite, ConnectorKeyID: value.ConnectorIdentity.KeyID, ConnectorPublicKey: value.ConnectorIdentity.PublicKey, ConnectorCredentialHash: value.ConnectorCredentialHash, DeviceCredentialSeed: value.DeviceCredentialSeed, State: value.State, UserID: value.UserID, DeviceID: value.DeviceID, ConnectorID: value.ConnectorID, CreatedAt: value.CreatedAt, ExpiresAt: value.ExpiresAt, ConnectorReviewedAt: value.ConnectorReviewedAt, ConfirmedAt: value.ConfirmedAt, CompletedAt: value.CompletedAt}
 }
 func pairingFromModel(value PairingModel) connectors.Pairing {
-	return connectors.Pairing{ID: value.ID, SecretHash: value.SecretHash, UserCodeHash: value.UserCodeHash, ConnectorName: value.ConnectorName, ConnectorIdentity: connectors.PublicIdentity{Version: value.ConnectorIdentityVersion, Suite: value.ConnectorIdentitySuite, KeyID: value.ConnectorKeyID, PublicKey: value.ConnectorPublicKey}, ConnectorCredentialHash: value.ConnectorCredentialHash, State: value.State, UserID: value.UserID, DeviceID: value.DeviceID, ConnectorID: value.ConnectorID, CreatedAt: value.CreatedAt, ExpiresAt: value.ExpiresAt, ConnectorReviewedAt: value.ConnectorReviewedAt, ConfirmedAt: value.ConfirmedAt, CompletedAt: value.CompletedAt}
+	return connectors.Pairing{ID: value.ID, SecretHash: value.SecretHash, UserCodeHash: value.UserCodeHash, ConnectorName: value.ConnectorName, ConnectorIdentity: connectors.PublicIdentity{Version: value.ConnectorIdentityVersion, Suite: value.ConnectorIdentitySuite, KeyID: value.ConnectorKeyID, PublicKey: value.ConnectorPublicKey}, ConnectorCredentialHash: value.ConnectorCredentialHash, DeviceCredentialSeed: value.DeviceCredentialSeed, State: value.State, UserID: value.UserID, DeviceID: value.DeviceID, ConnectorID: value.ConnectorID, CreatedAt: value.CreatedAt, ExpiresAt: value.ExpiresAt, ConnectorReviewedAt: value.ConnectorReviewedAt, ConfirmedAt: value.ConfirmedAt, CompletedAt: value.CompletedAt}
 }
 
 func trustModel(value connectors.Trust) *TrustModel {

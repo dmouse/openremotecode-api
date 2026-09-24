@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,9 +21,21 @@ import (
 
 const relayWebSocketProtocol = "opencode-remote.v1"
 
+const (
+	// Revocations close sockets directly through Hub.Disconnect. The periodic check is the
+	// safety net for anything that did not announce itself, such as an account disabled in
+	// the database, so it runs on a long interval instead of every second. See ADR 0021.
+	defaultRevalidationInterval = 30 * time.Second
+	revalidationTimeout         = 5 * time.Second
+	// After a check fails for a reason other than authorization, such as a database error,
+	// the socket stays open and is checked again sooner. The authorization lease still bounds
+	// how long it can live without a successful check.
+	revalidationRetry = 5 * time.Second
+)
+
 type AdmissionService interface {
 	ConsumeRelayTicket(context.Context, string) (connectors.Admission, error)
-	ValidateConnectorAdmission(context.Context, connectors.Admission) error
+	ValidateAdmission(context.Context, connectors.Admission) error
 }
 
 type HandlerConfig struct {
@@ -30,16 +44,36 @@ type HandlerConfig struct {
 	Now            func() time.Time
 	// DevelopmentEcho also mounts the insecure /dev/relay echo endpoint. Never enable in production.
 	DevelopmentEcho bool
+	// Hub holds the live sockets. Supplying one lets the services that commit revocations
+	// close sockets through it; nil creates a private hub.
+	Hub *Hub
+	// RevalidationInterval is the average time between periodic authorization checks of a
+	// live socket, jittered by half either way. Zero means 30 seconds.
+	RevalidationInterval time.Duration
 }
 
 type Handler struct {
-	admissions      AdmissionService
-	hub             *secureHub
-	upgrader        websocket.Upgrader
-	allowedOrigins  map[string]struct{}
-	logger          *slog.Logger
-	now             func() time.Time
-	developmentEcho bool
+	admissions           AdmissionService
+	hub                  *secureHub
+	upgrader             websocket.Upgrader
+	allowedOrigins       map[string]struct{}
+	logger               *slog.Logger
+	now                  func() time.Time
+	developmentEcho      bool
+	revalidationInterval time.Duration
+}
+
+// Hub is the set of live relay sockets, shared between the relay handler and the services
+// that commit revocations.
+type Hub struct{ secure *secureHub }
+
+func NewHub() *Hub { return &Hub{secure: newSecureHub()} }
+
+// Disconnect closes every live socket the revocation covers and returns how many. It is
+// called after the revocation has committed, so a socket registering concurrently either is
+// closed here or fails the check it runs immediately after registering.
+func (hub *Hub) Disconnect(revocation connectors.Revocation) int {
+	return hub.secure.disconnect(revocation.Covers)
 }
 
 func NewHandler(admissions AdmissionService, config HandlerConfig) *Handler {
@@ -49,13 +83,20 @@ func NewHandler(admissions AdmissionService, config HandlerConfig) *Handler {
 	if config.Logger == nil {
 		config.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if config.Hub == nil {
+		config.Hub = NewHub()
+	}
+	if config.RevalidationInterval <= 0 {
+		config.RevalidationInterval = defaultRevalidationInterval
+	}
 	handler := &Handler{
-		admissions:      admissions,
-		hub:             newSecureHub(),
-		allowedOrigins:  make(map[string]struct{}, len(config.AllowedOrigins)),
-		logger:          config.Logger,
-		now:             config.Now,
-		developmentEcho: config.DevelopmentEcho,
+		admissions:           admissions,
+		hub:                  config.Hub.secure,
+		allowedOrigins:       make(map[string]struct{}, len(config.AllowedOrigins)),
+		logger:               config.Logger,
+		now:                  config.Now,
+		developmentEcho:      config.DevelopmentEcho,
+		revalidationInterval: config.RevalidationInterval,
 	}
 	for _, origin := range config.AllowedOrigins {
 		if origin = strings.TrimSpace(origin); origin != "" {
@@ -126,11 +167,9 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	}()
 
 	go peer.writePump()
-	if admission.Role == connectors.RelayRoleConnector {
-		validationContext, cancelValidation := context.WithCancel(request.Context())
-		defer cancelValidation()
-		go handler.monitorConnectorAuthorization(validationContext, peer, admission)
-	}
+	validationContext, cancelValidation := context.WithCancel(request.Context())
+	defer cancelValidation()
+	go handler.monitorAuthorization(validationContext, peer, admission)
 	authorizationTimer := time.AfterFunc(admission.AuthorizationExpiresAt.Sub(handler.now()), peer.stop)
 	defer authorizationTimer.Stop()
 	connection.SetReadLimit(maxRelayFrameLength)
@@ -151,26 +190,42 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	}
 }
 
-// Recheck immediately and every second, including idle connections and admission/revocation races.
-func (handler *Handler) monitorConnectorAuthorization(ctx context.Context, peer *securePeer, admission connectors.Admission) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+// monitorAuthorization is the safety net behind Hub.Disconnect. It checks once immediately,
+// which closes the race with a revocation that committed after the ticket was consumed but
+// before this socket registered, then again at a jittered interval so sockets do not all hit
+// the database at once. Only an authorization failure closes the socket; a transient error is
+// retried sooner, and the authorization lease still ends the socket if checks keep failing.
+// Before revocations were announced, this ran every second for every socket and was the
+// relay's capacity ceiling (ADR 0020).
+func (handler *Handler) monitorAuthorization(ctx context.Context, peer *securePeer, admission connectors.Admission) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
-		checkContext, cancel := context.WithTimeout(ctx, time.Second)
-		err := handler.admissions.ValidateConnectorAdmission(checkContext, admission)
-		cancel()
-		if err != nil {
-			peer.stop()
-			return
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-peer.done:
 			return
-		case <-ticker.C:
+		case <-timer.C:
+		}
+		checkContext, cancel := context.WithTimeout(ctx, revalidationTimeout)
+		err := handler.admissions.ValidateAdmission(checkContext, admission)
+		cancel()
+		switch {
+		case err == nil:
+			timer.Reset(jittered(handler.revalidationInterval))
+		case errors.Is(err, connectors.ErrUnauthorized):
+			peer.stop()
+			return
+		default:
+			timer.Reset(min(revalidationRetry, handler.revalidationInterval))
 		}
 	}
+}
+
+// jittered spreads checks uniformly over half to one and a half intervals.
+func jittered(interval time.Duration) time.Duration {
+	return interval/2 + rand.N(interval)
 }
 
 func (handler *Handler) Close() {
@@ -222,6 +277,7 @@ func relayReadyMessage(admission connectors.Admission) []byte {
 }
 
 type securePeer struct {
+	admission  connectors.Admission
 	connection *websocket.Conn
 	userID     string
 	role       string
@@ -240,6 +296,7 @@ func newSecurePeer(connection *websocket.Conn, admission connectors.Admission, h
 		trusted[identity.KeyID] = struct{}{}
 	}
 	return &securePeer{
+		admission:  admission,
 		connection: connection,
 		userID:     admission.UserID,
 		role:       admission.Role,
@@ -397,6 +454,23 @@ func (hub *secureHub) route(sender *securePeer, recipientKeyID string, message [
 		recipient.enqueue(message)
 	}
 	return true
+}
+
+// disconnect stops every registered peer whose admission matches. Each peer's own serve loop
+// then unregisters it and notifies its partners, exactly as for any other disconnect.
+func (hub *secureHub) disconnect(matches func(connectors.Admission) bool) int {
+	hub.mutex.RLock()
+	var matched []*securePeer
+	for _, peer := range hub.peers {
+		if matches(peer.admission) {
+			matched = append(matched, peer)
+		}
+	}
+	hub.mutex.RUnlock()
+	for _, peer := range matched {
+		peer.stop()
+	}
+	return len(matched)
 }
 
 func (hub *secureHub) close() {

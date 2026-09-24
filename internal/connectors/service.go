@@ -28,6 +28,15 @@ const (
 	defaultCredentialActivationWindow = 15 * time.Minute
 	defaultPollInterval               = 2 * time.Second
 	defaultAuthorizationLease         = 5 * time.Minute
+	deviceCredentialSeedLength        = 32
+	// Incorrect pairing codes are capped per account and across the service. The user code
+	// is 40 bits and lives ten minutes, so guessing is only a threat at volume: per-account
+	// caps make volume cost verified accounts rather than IP addresses, and the global cap
+	// bounds the total guessing rate however many accounts an attacker holds.
+	defaultAccountClaimFailureLimit  = 10
+	defaultAccountClaimFailureWindow = time.Hour
+	defaultGlobalClaimFailureLimit   = 120
+	defaultGlobalClaimFailureWindow  = time.Minute
 )
 
 type ServiceOptions struct {
@@ -49,6 +58,9 @@ type ServiceOptions struct {
 	PollInterval                time.Duration
 	AuthorizeAccount            func(context.Context, string) error
 	AuthorizeSession            func(context.Context, string, string) error
+	// OnRevoked is told about each committed connector or device revocation, so live relay
+	// sockets can be closed at once rather than at their next periodic check.
+	OnRevoked func(Revocation)
 }
 
 type Service struct {
@@ -68,6 +80,11 @@ type Service struct {
 	pollInterval                time.Duration
 	authorizeAccount            func(context.Context, string) error
 	authorizeSession            func(context.Context, string, string) error
+	accountClaimFailureLimit    int
+	accountClaimFailureWindow   time.Duration
+	globalClaimFailureLimit     int
+	globalClaimFailureWindow    time.Duration
+	onRevoked                   func(Revocation)
 }
 
 func NewService(repository Repository, options ServiceOptions) (*Service, error) {
@@ -119,6 +136,9 @@ func NewService(repository Repository, options ServiceOptions) (*Service, error)
 	if options.PollInterval <= 0 {
 		options.PollInterval = defaultPollInterval
 	}
+	if options.OnRevoked == nil {
+		options.OnRevoked = func(Revocation) {}
+	}
 	return &Service{
 		repository:                  repository,
 		now:                         options.Now,
@@ -136,6 +156,11 @@ func NewService(repository Repository, options ServiceOptions) (*Service, error)
 		pollInterval:                options.PollInterval,
 		authorizeAccount:            options.AuthorizeAccount,
 		authorizeSession:            options.AuthorizeSession,
+		accountClaimFailureLimit:    defaultAccountClaimFailureLimit,
+		accountClaimFailureWindow:   defaultAccountClaimFailureWindow,
+		globalClaimFailureLimit:     defaultGlobalClaimFailureLimit,
+		globalClaimFailureWindow:    defaultGlobalClaimFailureWindow,
+		onRevoked:                   options.OnRevoked,
 	}, nil
 }
 
@@ -226,7 +251,7 @@ func (service *Service) ClaimPairing(ctx context.Context, input ClaimPairingInpu
 	}
 	now := service.now().UTC()
 	var result ClaimPairingResult
-	expired := false
+	expired, wrongCode := false, false
 	err = service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
 		if err := service.authorizeAccount(ctx, input.UserID); err != nil {
 			return ErrUnauthorized
@@ -238,7 +263,21 @@ func (service *Service) ClaimPairing(ctx context.Context, input ClaimPairingInpu
 		if challenge.Purpose != ChallengePurposeDevice || challenge.UserID == nil || *challenge.UserID != input.UserID || challenge.UsedAt != nil || !challenge.ExpiresAt.After(now) {
 			return ErrUnauthorized
 		}
+		if err := service.checkClaimFailures(ctx, store, input.UserID, now); err != nil {
+			return err
+		}
+		// Every guess spends its challenge, so each costs a fresh signed challenge. This and
+		// the failure record below must commit even when the code is wrong, which is why a
+		// wrong code returns nil here and is reported after the transaction.
+		challenge.UsedAt = &now
+		if err := store.SaveChallenge(ctx, challenge); err != nil {
+			return err
+		}
 		pairing, err := store.PairingByCodeForUpdate(ctx, service.hashUserCode(code))
+		if errors.Is(err, ErrNotFound) {
+			wrongCode = true
+			return store.RecordClaimFailure(ctx, input.UserID, now, now.Add(-service.accountClaimFailureWindow))
+		}
 		if err != nil {
 			return err
 		}
@@ -270,10 +309,6 @@ func (service *Service) ClaimPairing(ctx context.Context, input ClaimPairingInpu
 			return ErrConflict
 		}
 
-		challenge.UsedAt = &now
-		if err := store.SaveChallenge(ctx, challenge); err != nil {
-			return err
-		}
 		pairing.State = PairingStateVerification
 		pairing.UserID = stringPointer(input.UserID)
 		pairing.DeviceID = stringPointer(device.ID)
@@ -295,10 +330,31 @@ func (service *Service) ClaimPairing(ctx context.Context, input ClaimPairingInpu
 	if err != nil {
 		return ClaimPairingResult{}, normalizeAuthorizationError(err)
 	}
+	if wrongCode {
+		return ClaimPairingResult{}, ErrInvalidCode
+	}
 	if expired {
 		return ClaimPairingResult{}, ErrExpired
 	}
 	return result, nil
+}
+
+// checkClaimFailures refuses a claim while the account, or the service as a whole, is over
+// its budget of incorrect codes. It runs before the code is looked up, so a refused claim
+// learns nothing about whether its code was right.
+func (service *Service) checkClaimFailures(ctx context.Context, store TransactionStore, userID string, now time.Time) error {
+	counts, err := store.ClaimFailuresForUpdate(ctx, userID,
+		now.Add(-service.accountClaimFailureWindow), now.Add(-service.globalClaimFailureWindow))
+	if err != nil {
+		return err
+	}
+	if counts.Account >= service.accountClaimFailureLimit {
+		return AttemptsExceededError{RetryAfter: max(time.Second, counts.AccountOldest.Add(service.accountClaimFailureWindow).Sub(now))}
+	}
+	if counts.Global >= service.globalClaimFailureLimit {
+		return AttemptsExceededError{RetryAfter: service.globalClaimFailureWindow}
+	}
+	return nil
 }
 
 func (service *Service) ConfirmPairing(ctx context.Context, userID, pairingID, deviceID string) (ConfirmPairingResult, error) {
@@ -328,10 +384,16 @@ func (service *Service) ConfirmPairing(ctx context.Context, userID, pairingID, d
 		if device.UserID != userID || device.RevokedAt != nil {
 			return ErrUnauthorized
 		}
-		deviceCredential := service.deriveDeviceCredential(device.Identity.KeyID)
 		if pairing.State == PairingStateCompleted && pairing.ConnectorID != nil && device.CredentialExpiresAt != nil {
-			if len(pairing.ConnectorCredentialHash) != sha256.Size ||
-				!hmac.Equal(hashSecret(deviceCredential), device.CredentialHash) {
+			// A retry of a completed confirmation re-derives the credential this pairing
+			// issued, so a lost response is recoverable and concurrent confirmations agree.
+			// If the device has since rotated or re-paired, the stored hash no longer matches
+			// and the old value is never handed out again.
+			if len(pairing.ConnectorCredentialHash) != sha256.Size || len(pairing.DeviceCredentialSeed) != deviceCredentialSeedLength {
+				return ErrConflict
+			}
+			deviceCredential := service.deriveDeviceCredential(pairing.DeviceCredentialSeed)
+			if !hmac.Equal(hashSecret(deviceCredential), device.CredentialHash) {
 				return ErrConflict
 			}
 			connector, err := store.ConnectorByIDForUpdate(ctx, *pairing.ConnectorID)
@@ -348,6 +410,12 @@ func (service *Service) ConfirmPairing(ctx context.Context, userID, pairingID, d
 			}
 			return nil
 		}
+		if pairing.State == PairingStateExpired {
+			// Rejected in OpenCode or cancelled: report it as over, not as still waiting.
+			return ErrExpired
+		}
+		// ConnectorReviewedAt is set only by an explicit approval in OpenCode (ApprovePairing),
+		// so an account that learned the user code cannot complete the pairing on its own.
 		if pairing.State != PairingStateVerification || pairing.ConnectorReviewedAt == nil || len(pairing.ConnectorCredentialHash) != sha256.Size {
 			return ErrConflict
 		}
@@ -371,6 +439,16 @@ func (service *Service) ConfirmPairing(ctx context.Context, userID, pairingID, d
 			return ErrConflict
 		}
 
+		// Every confirmation issues a fresh credential from its own random seed. Deriving it
+		// from anything stable (the device key ID, formerly) would hand a re-paired device its
+		// old credential back, undoing any rotation, and would let the server key alone
+		// recompute every device's credential.
+		seed := make([]byte, deviceCredentialSeedLength)
+		if _, err := io.ReadFull(service.random, seed); err != nil {
+			return err
+		}
+		pairing.DeviceCredentialSeed = seed
+		deviceCredential := service.deriveDeviceCredential(seed)
 		deviceCredentialExpiresAt := now.Add(service.deviceCredentialLifetime)
 		device.CredentialHash = hashSecret(deviceCredential)
 		device.CredentialExpiresAt = &deviceCredentialExpiresAt
@@ -446,12 +524,7 @@ func (service *Service) PollPairing(ctx context.Context, pairingSecret string) (
 			result.Transcript = &transcript
 		}
 		if pairing.State == PairingStateVerification {
-			if pairing.ConnectorReviewedAt == nil {
-				pairing.ConnectorReviewedAt = &now
-				if err := store.SavePairing(ctx, pairing); err != nil {
-					return err
-				}
-			}
+			// Observing the transcript approves nothing; see ApprovePairing.
 			return nil
 		}
 		if pairing.State == PairingStateCompleted && pairing.ConnectorID != nil {
@@ -514,6 +587,74 @@ func (service *Service) PollPairing(ctx context.Context, pairingSecret string) (
 		return PollPairingResult{}, normalizeAuthorizationError(err)
 	}
 	return result, nil
+}
+
+// ApprovePairing records that the person at the OpenCode machine compared the safety code
+// and approved the device that claimed this pairing. Confirmation requires it, so a pairing
+// completes only with consent on both sides: without it, anyone who saw or guessed the user
+// code could bind this OpenCode instance to their own account and drive it.
+//
+// It is authenticated by the pairing secret, which only the connector holds, and bound to
+// the device key the connector was shown, so an approval can never apply to another device.
+// Repeating it is a no-op, so a retry after a lost response succeeds.
+func (service *Service) ApprovePairing(ctx context.Context, pairingID, pairingSecret, deviceKeyID string) error {
+	if pairingID == "" || !validToken(pairingSecret, "orp_") {
+		return ErrUnauthorized
+	}
+	if deviceKeyID == "" || len(deviceKeyID) > 64 {
+		return ErrInvalidInput
+	}
+	now := service.now().UTC()
+	expired := false
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+		pairing, err := store.PairingBySecretForUpdate(ctx, hashSecret(pairingSecret))
+		if err != nil {
+			return err
+		}
+		if pairing.ID != pairingID {
+			return ErrUnauthorized
+		}
+		if pairing.State == PairingStateExpired {
+			expired = true
+			return nil
+		}
+		if !pairing.ExpiresAt.After(now) {
+			if pairing.State == PairingStateCompleted {
+				return ErrExpired
+			}
+			pairing.State = PairingStateExpired
+			expired = true
+			return store.SavePairing(ctx, pairing)
+		}
+		if pairing.State != PairingStateVerification || pairing.DeviceID == nil {
+			return ErrConflict
+		}
+		device, err := store.DeviceByIDForUpdate(ctx, *pairing.DeviceID)
+		if err != nil {
+			return err
+		}
+		if device.Identity.KeyID != deviceKeyID {
+			return ErrConflict
+		}
+		if pairing.ConnectorReviewedAt != nil {
+			return nil
+		}
+		pairing.ConnectorReviewedAt = &now
+		if err := store.SavePairing(ctx, pairing); err != nil {
+			return err
+		}
+		return store.AppendAuditEvent(ctx, AuditEvent{
+			UserID: pairing.UserID, DeviceID: pairing.DeviceID, PairingID: &pairing.ID,
+			EventType: "pairing.connector_approved", OccurredAt: now,
+		})
+	})
+	if err != nil {
+		return normalizeAuthorizationError(err)
+	}
+	if expired {
+		return ErrExpired
+	}
+	return nil
 }
 
 func (service *Service) CancelPairing(ctx context.Context, pairingID, pairingSecret string) error {
@@ -827,11 +968,13 @@ func (service *Service) RevokeConnector(ctx context.Context, credential string) 
 		return ErrUnauthorized
 	}
 	now := service.now().UTC()
+	var revoked Revocation
 	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
 		connector, err := store.ConnectorByCredentialForUpdate(ctx, hashSecret(credential))
 		if err != nil {
 			return err
 		}
+		revoked = Revocation{UserID: connector.UserID, ConnectorID: connector.ID}
 		if connector.RevokedAt != nil {
 			return nil
 		}
@@ -847,7 +990,11 @@ func (service *Service) RevokeConnector(ctx context.Context, credential string) 
 			EventType: "connector.revoked", OccurredAt: now,
 		})
 	})
-	return normalizeAuthorizationError(err)
+	if err != nil {
+		return normalizeAuthorizationError(err)
+	}
+	service.onRevoked(revoked)
+	return nil
 }
 
 // RevokeAccountConnector lets an authenticated account revoke its own connector,
@@ -862,7 +1009,7 @@ func (service *Service) RevokeAccountConnector(ctx context.Context, userID, conn
 		return ErrUnauthorized
 	}
 	now := service.now().UTC()
-	return service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
 		connector, err := store.ConnectorByIDForUpdate(ctx, connectorID)
 		if err != nil {
 			return err
@@ -882,6 +1029,65 @@ func (service *Service) RevokeAccountConnector(ctx context.Context, userID, conn
 			EventType: "connector.revoked", OccurredAt: now,
 		})
 	})
+	if err != nil {
+		return err
+	}
+	// Repeats notify too: closing a socket that is already gone does nothing.
+	service.onRevoked(Revocation{UserID: userID, ConnectorID: connectorID})
+	return nil
+}
+
+// RevokeAccountDevice lets an authenticated account revoke one of its client devices,
+// typically a lost or replaced phone, from any of its sessions. Its credential, every
+// trust relationship it holds, and any live relay socket end together; connectors stop
+// receiving its identity at their next admission. Missing and foreign IDs are
+// indistinguishable, and a repeat is a no-op so a retry after a lost response succeeds.
+// A revoked device cannot be re-paired: its key must be replaced by a new installation.
+func (service *Service) RevokeAccountDevice(ctx context.Context, userID, deviceID string) error {
+	if userID == "" || deviceID == "" || len(deviceID) > 64 {
+		return ErrInvalidInput
+	}
+	if err := service.authorizeAccount(ctx, userID); err != nil {
+		return ErrUnauthorized
+	}
+	now := service.now().UTC()
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+		device, err := store.DeviceByIDForUpdate(ctx, deviceID)
+		if err != nil {
+			return err
+		}
+		if device.UserID != userID {
+			return ErrNotFound
+		}
+		if device.RevokedAt != nil {
+			return nil
+		}
+		device.RevokedAt = &now
+		device.PendingCredentialHash = nil
+		device.PendingCredentialExpiresAt = nil
+		if err := store.SaveDevice(ctx, device); err != nil {
+			return err
+		}
+		if err := store.RevokeDeviceTrust(ctx, userID, device.ID, now); err != nil {
+			return err
+		}
+		return store.AppendAuditEvent(ctx, AuditEvent{
+			UserID: &device.UserID, DeviceID: &device.ID,
+			EventType: "device.revoked", OccurredAt: now,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	service.onRevoked(Revocation{UserID: userID, DeviceID: deviceID})
+	return nil
+}
+
+func (service *Service) ListDevices(ctx context.Context, userID string) ([]Device, error) {
+	if userID == "" {
+		return nil, ErrUnauthorized
+	}
+	return service.repository.ListDevices(ctx, userID)
 }
 
 func (service *Service) RenameAccountConnector(ctx context.Context, userID, connectorID, name string) (Connector, error) {
@@ -916,21 +1122,47 @@ func (service *Service) RenameAccountConnector(ctx context.Context, userID, conn
 	return result, err
 }
 
-func (service *Service) ValidateConnectorAdmission(ctx context.Context, admission Admission) error {
-	if admission.Role != RelayRoleConnector || admission.UserID == "" || admission.SubjectID == "" {
+// ValidateAdmission rechecks a live relay admission against current state, so revoking
+// a connector, a device, or a client's account session ends its socket promptly
+// instead of at the end of its lease.
+func (service *Service) ValidateAdmission(ctx context.Context, admission Admission) error {
+	if admission.UserID == "" || admission.SubjectID == "" {
+		return ErrUnauthorized
+	}
+	switch admission.Role {
+	case RelayRoleConnector:
+	case RelayRoleClient:
+		if admission.SessionID == "" {
+			return ErrUnauthorized
+		}
+	default:
 		return ErrUnauthorized
 	}
 	now := service.now().UTC()
 	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
-		connector, err := store.ConnectorByIDForUpdate(ctx, admission.SubjectID)
+		if admission.Role == RelayRoleConnector {
+			connector, err := store.ConnectorByIDForUpdate(ctx, admission.SubjectID)
+			if err != nil {
+				return err
+			}
+			if connector.UserID != admission.UserID || connector.Identity != admission.Identity || connector.RevokedAt != nil ||
+				connector.CredentialExpiresAt == nil || !connector.CredentialExpiresAt.After(now) {
+				return ErrUnauthorized
+			}
+			return service.authorizeAccount(ctx, connector.UserID)
+		}
+		device, err := store.DeviceByIDForUpdate(ctx, admission.SubjectID)
 		if err != nil {
 			return err
 		}
-		if connector.UserID != admission.UserID || connector.Identity != admission.Identity || connector.RevokedAt != nil ||
-			connector.CredentialExpiresAt == nil || !connector.CredentialExpiresAt.After(now) {
+		if device.UserID != admission.UserID || device.Identity != admission.Identity || device.ActivatedAt == nil ||
+			device.RevokedAt != nil || device.CredentialExpiresAt == nil || !device.CredentialExpiresAt.After(now) {
 			return ErrUnauthorized
 		}
-		return service.authorizeAccount(ctx, connector.UserID)
+		if err := service.authorizeAccount(ctx, device.UserID); err != nil {
+			return err
+		}
+		return service.authorizeSession(ctx, device.UserID, admission.SessionID)
 	})
 	return normalizeAuthorizationError(err)
 }
@@ -1060,6 +1292,9 @@ func (service *Service) ConsumeRelayTicket(ctx context.Context, ticket string) (
 			leaseExpiresAt = *record.AuthorizationExpiresAt
 		}
 		admission = Admission{UserID: record.UserID, Role: record.Role, SubjectID: record.SubjectID, Identity: identity, TrustedIdentities: trusted, AuthorizationExpiresAt: leaseExpiresAt}
+		if record.Role == RelayRoleClient {
+			admission.SessionID = record.CredentialID
+		}
 		return nil
 	})
 	if err != nil {
@@ -1199,10 +1434,13 @@ func deriveConnectorCredential(pairingSecret string) string {
 	return "orc_" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func (service *Service) deriveDeviceCredential(keyID string) string {
+// deriveDeviceCredential turns a pairing's random seed into the device credential it issues.
+// The seed lives only on the pairing row, so recomputing a credential takes both the database
+// and the server key; the key exists so the database alone does not yield one either.
+func (service *Service) deriveDeviceCredential(seed []byte) string {
 	mac := hmac.New(sha256.New, service.deviceCredentialKey)
-	_, _ = mac.Write([]byte("opencode-remote/device-credential/v1\x00"))
-	_, _ = mac.Write([]byte(keyID))
+	_, _ = mac.Write([]byte("opencode-remote/device-credential/v2\x00"))
+	_, _ = mac.Write(seed)
 	return "ord_" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"opencode-remote/server/internal/connectors"
@@ -38,6 +37,7 @@ type ConnectorService interface {
 	ConfirmPairing(context.Context, string, string, string) (connectors.ConfirmPairingResult, error)
 	PollPairing(context.Context, string) (connectors.PollPairingResult, error)
 	CancelPairing(context.Context, string, string) error
+	ApprovePairing(context.Context, string, string, string) error
 	RevokeConnector(context.Context, string) error
 	RotateConnectorCredential(context.Context, string) (connectors.RotationResult, error)
 	ActivateConnectorCredential(context.Context, string) (time.Time, error)
@@ -49,6 +49,8 @@ type ConnectorService interface {
 	IssueBrowserTicket(context.Context, string, string, string, string, time.Time) (connectors.TicketResult, error)
 	IssueConnectorTicket(context.Context, string) (connectors.TicketResult, error)
 	ListConnectors(context.Context, string) ([]connectors.Connector, error)
+	RevokeAccountDevice(context.Context, string, string) error
+	ListDevices(context.Context, string) ([]connectors.Device, error)
 }
 
 type Config struct {
@@ -69,10 +71,10 @@ type Handler struct {
 	cookiePath     string
 	logger         *slog.Logger
 	now            func() time.Time
-	beginLimiter   *fixedWindowLimiter
-	claimLimiter   *fixedWindowLimiter
-	pollLimiter    *fixedWindowLimiter
-	ticketLimiter  *fixedWindowLimiter
+	beginLimiter   *httpserver.RateLimiter
+	claimLimiter   *httpserver.RateLimiter
+	pollLimiter    *httpserver.RateLimiter
+	ticketLimiter  *httpserver.RateLimiter
 }
 
 func NewHandler(authentication AuthenticationService, connectorService ConnectorService, config Config) *Handler {
@@ -90,10 +92,10 @@ func NewHandler(authentication AuthenticationService, connectorService Connector
 		cookieSecure:   config.CookieSecure,
 		logger:         config.Logger,
 		now:            config.Now,
-		beginLimiter:   newFixedWindowLimiter(10, time.Minute),
-		claimLimiter:   newFixedWindowLimiter(10, time.Minute),
-		pollLimiter:    newFixedWindowLimiter(60, time.Minute),
-		ticketLimiter:  newFixedWindowLimiter(60, time.Minute),
+		beginLimiter:   httpserver.NewRateLimiter(10, time.Minute),
+		claimLimiter:   httpserver.NewRateLimiter(10, time.Minute),
+		pollLimiter:    httpserver.NewRateLimiter(60, time.Minute),
+		ticketLimiter:  httpserver.NewRateLimiter(60, time.Minute),
 	}
 	if config.CookieSecure {
 		handler.cookieName, handler.cookiePath = secureDeviceCookieName, "/"
@@ -114,12 +116,16 @@ func (handler *Handler) RegisterRoutes(router gin.IRouter) {
 	pairings.POST("", handler.plugin(handler.beginLimiter, handler.beginPairing))
 	pairings.POST("/:pairingID/poll", handler.plugin(handler.pollLimiter, handler.pollPairing))
 	pairings.POST("/:pairingID/cancel", handler.plugin(handler.pollLimiter, handler.cancelPairing))
+	pairings.POST("/:pairingID/approve", handler.plugin(handler.pollLimiter, handler.approvePairing))
 	pairings.POST("/claim", handler.browser(handler.claimLimiter, handler.claimPairing))
 	pairings.POST("/:pairingID/confirm", handler.browser(handler.claimLimiter, handler.confirmPairing))
 
 	router.POST("/v1/devices/challenge", handler.browser(handler.claimLimiter, handler.deviceChallenge))
 	router.POST("/v1/devices/self/rotate", handler.browser(handler.ticketLimiter, handler.rotateDeviceCredential))
 	router.POST("/v1/devices/self/rotate/activate", handler.browser(handler.ticketLimiter, handler.activateDeviceCredential))
+	router.POST("/v1/devices/:deviceID/revoke", handler.browser(handler.ticketLimiter, handler.revokeAccountDevice))
+	router.GET("/v1/devices", gin.WrapF(handler.listDevices))
+	router.HEAD("/v1/devices", gin.WrapF(handler.listDevices))
 	router.POST("/v1/relay/tickets", handler.limited(handler.ticketLimiter, handler.issueTicket))
 
 	connectors := router.Group("/v1/connectors")
@@ -136,15 +142,15 @@ func (handler *Handler) RegisterRoutes(router gin.IRouter) {
 
 // plugin, browser, and limited attach the audience gate and rate limiter for a route,
 // keeping the route table readable as "audience, limiter, handler".
-func (handler *Handler) plugin(limiter *fixedWindowLimiter, next http.HandlerFunc) gin.HandlerFunc {
+func (handler *Handler) plugin(limiter *httpserver.RateLimiter, next http.HandlerFunc) gin.HandlerFunc {
 	return httpserver.WrapHandler(handler.pluginOnly(limiter, next))
 }
 
-func (handler *Handler) browser(limiter *fixedWindowLimiter, next http.HandlerFunc) gin.HandlerFunc {
+func (handler *Handler) browser(limiter *httpserver.RateLimiter, next http.HandlerFunc) gin.HandlerFunc {
 	return httpserver.WrapHandler(handler.browserOnly(limiter, next))
 }
 
-func (handler *Handler) limited(limiter *fixedWindowLimiter, next http.HandlerFunc) gin.HandlerFunc {
+func (handler *Handler) limited(limiter *httpserver.RateLimiter, next http.HandlerFunc) gin.HandlerFunc {
 	return httpserver.WrapHandler(handler.rateLimited(limiter, next))
 }
 
@@ -268,6 +274,28 @@ func (handler *Handler) cancelPairing(response http.ResponseWriter, request *htt
 	}
 	if err := handler.connectors.CancelPairing(request.Context(), request.PathValue("pairingID"), secret); err != nil {
 		handler.writeServiceError(response, "cancel_pairing", err)
+		return
+	}
+	response.WriteHeader(http.StatusNoContent)
+}
+
+// approvePairing records the approval given in OpenCode after comparing the safety code.
+// The body names the device key the connector was shown, binding the approval to it.
+func (handler *Handler) approvePairing(response http.ResponseWriter, request *http.Request) {
+	secret, err := authorizationToken(request, "Pairing")
+	if err != nil {
+		handler.writeServiceError(response, "approve_pairing", connectors.ErrUnauthorized)
+		return
+	}
+	var input struct {
+		DeviceKeyID string `json:"deviceKeyId"`
+	}
+	if err := decodeJSON(response, request, &input); err != nil {
+		writeDecodeError(response, err)
+		return
+	}
+	if err := handler.connectors.ApprovePairing(request.Context(), request.PathValue("pairingID"), secret, input.DeviceKeyID); err != nil {
+		handler.writeServiceError(response, "approve_pairing", err)
 		return
 	}
 	response.WriteHeader(http.StatusNoContent)
@@ -417,6 +445,44 @@ func (handler *Handler) revokeAccountConnector(response http.ResponseWriter, req
 	response.WriteHeader(http.StatusNoContent)
 }
 
+// revokeAccountDevice needs only an account session, not the device's own cookie: its
+// purpose is removing a device that is lost, so the caller usually cannot present it.
+func (handler *Handler) revokeAccountDevice(response http.ResponseWriter, request *http.Request) {
+	principal, ok := handler.accessPrincipal(response, request)
+	if !ok {
+		return
+	}
+	err := handler.connectors.RevokeAccountDevice(request.Context(), principal.Account.ID, request.PathValue("deviceID"))
+	if errors.Is(err, connectors.ErrNotFound) {
+		writeError(response, http.StatusNotFound, "not_found", "Device is unavailable")
+		return
+	}
+	if err != nil {
+		handler.writeServiceError(response, "revoke_account_device", err)
+		return
+	}
+	response.WriteHeader(http.StatusNoContent)
+}
+
+func (handler *Handler) listDevices(response http.ResponseWriter, request *http.Request) {
+	principal, ok := handler.accessPrincipal(response, request)
+	if !ok {
+		return
+	}
+	items, err := handler.connectors.ListDevices(request.Context(), principal.Account.ID)
+	if err != nil {
+		handler.writeServiceError(response, "list_devices", err)
+		return
+	}
+	documents := make([]deviceDocument, 0, len(items))
+	for _, item := range items {
+		documents = append(documents, deviceDocument{ID: item.ID, Name: item.Name, Identity: item.Identity, CreatedAt: item.CreatedAt})
+	}
+	writeJSON(response, http.StatusOK, struct {
+		Devices []deviceDocument `json:"devices"`
+	}{Devices: documents})
+}
+
 func (handler *Handler) renameAccountConnector(response http.ResponseWriter, request *http.Request) {
 	principal, ok := handler.accessPrincipal(response, request)
 	if !ok {
@@ -460,7 +526,7 @@ func (handler *Handler) accessPrincipal(response http.ResponseWriter, request *h
 	return principal, true
 }
 
-func (handler *Handler) pluginOnly(limiter *fixedWindowLimiter, next http.Handler) http.Handler {
+func (handler *Handler) pluginOnly(limiter *httpserver.RateLimiter, next http.Handler) http.Handler {
 	return handler.rateLimited(limiter, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Origin") != "" || request.Header.Get("Sec-Fetch-Site") == "cross-site" {
 			writeError(response, http.StatusForbidden, "origin_not_allowed", "Request origin is not allowed")
@@ -470,7 +536,7 @@ func (handler *Handler) pluginOnly(limiter *fixedWindowLimiter, next http.Handle
 	}))
 }
 
-func (handler *Handler) browserOnly(limiter *fixedWindowLimiter, next http.Handler) http.Handler {
+func (handler *Handler) browserOnly(limiter *httpserver.RateLimiter, next http.Handler) http.Handler {
 	return handler.rateLimited(limiter, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if !handler.allowedBrowserOrigin(response, request) {
 			return
@@ -493,9 +559,9 @@ func (handler *Handler) allowedBrowserOrigin(response http.ResponseWriter, reque
 	return false
 }
 
-func (handler *Handler) rateLimited(limiter *fixedWindowLimiter, next http.Handler) http.Handler {
+func (handler *Handler) rateLimited(limiter *httpserver.RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		allowed, retryAfter := limiter.allow(clientAddress(request, handler.trustedProxies), handler.now())
+		allowed, retryAfter := limiter.Allow(httpserver.RateLimitKey(request, handler.trustedProxies), handler.now())
 		if !allowed {
 			response.Header().Set("Retry-After", strconv.Itoa(max(1, int((retryAfter+time.Second-1)/time.Second))))
 			writeError(response, http.StatusTooManyRequests, "rate_limited", "Too many requests")
@@ -506,7 +572,14 @@ func (handler *Handler) rateLimited(limiter *fixedWindowLimiter, next http.Handl
 }
 
 func (handler *Handler) writeServiceError(response http.ResponseWriter, operation string, err error) {
+	var exceeded connectors.AttemptsExceededError
 	switch {
+	case errors.As(err, &exceeded):
+		response.Header().Set("Retry-After", strconv.Itoa(max(1, int((exceeded.RetryAfter+time.Second-1)/time.Second))))
+		writeError(response, http.StatusTooManyRequests, "too_many_attempts", "Too many incorrect pairing codes; try again later")
+	case errors.Is(err, connectors.ErrInvalidCode):
+		// 404, never 401: clients treat 401 as a lost session and sign the user out.
+		writeError(response, http.StatusNotFound, "invalid_code", "Pairing code not found")
 	case errors.Is(err, connectors.ErrInvalidInput):
 		writeError(response, http.StatusBadRequest, "invalid_request", "Request is invalid")
 	case errors.Is(err, connectors.ErrUnauthorized), errors.Is(err, identity.ErrUnauthorized):
@@ -648,6 +721,12 @@ type rotateConnectorResponse struct {
 type activateConnectorResponse struct {
 	CredentialExpiresAt time.Time `json:"credentialExpiresAt"`
 }
+type deviceDocument struct {
+	ID        string                    `json:"id"`
+	Name      string                    `json:"name"`
+	Identity  connectors.PublicIdentity `json:"identity"`
+	CreatedAt time.Time                 `json:"createdAt"`
+}
 type connectorDocument struct {
 	ID        string                    `json:"id"`
 	Name      string                    `json:"name"`
@@ -712,73 +791,4 @@ func writeJSON(response http.ResponseWriter, status int, document any) {
 	response.Header().Set("Content-Type", "application/json")
 	response.WriteHeader(status)
 	_ = json.NewEncoder(response).Encode(document)
-}
-
-type window struct {
-	startedAt time.Time
-	count     int
-}
-type fixedWindowLimiter struct {
-	mutex    sync.Mutex
-	maximum  int
-	duration time.Duration
-	clients  map[string]window
-}
-
-func newFixedWindowLimiter(maximum int, duration time.Duration) *fixedWindowLimiter {
-	return &fixedWindowLimiter{maximum: maximum, duration: duration, clients: make(map[string]window)}
-}
-func (limiter *fixedWindowLimiter) allow(client string, now time.Time) (bool, time.Duration) {
-	limiter.mutex.Lock()
-	defer limiter.mutex.Unlock()
-	entry := limiter.clients[client]
-	if entry.startedAt.IsZero() || !now.Before(entry.startedAt.Add(limiter.duration)) {
-		limiter.clients[client] = window{startedAt: now, count: 1}
-		return true, 0
-	}
-	if entry.count >= limiter.maximum {
-		return false, entry.startedAt.Add(limiter.duration).Sub(now)
-	}
-	entry.count++
-	limiter.clients[client] = entry
-	return true, 0
-}
-
-func clientAddress(request *http.Request, trustedProxies []*net.IPNet) string {
-	peer := remoteHost(request.RemoteAddr)
-	peerIP := net.ParseIP(peer)
-	if peerIP == nil || !ipInNetworks(peerIP, trustedProxies) {
-		return peer
-	}
-	forwardedFor := request.Header.Values("X-Forwarded-For")
-	if len(forwardedFor) != 1 {
-		return peer
-	}
-	addresses := strings.Split(forwardedFor[0], ",")
-	for index := len(addresses) - 1; index >= 0; index-- {
-		address := strings.TrimSpace(addresses[index])
-		ip := net.ParseIP(address)
-		if ip == nil {
-			return peer
-		}
-		if !ipInNetworks(ip, trustedProxies) {
-			return address
-		}
-	}
-	return peer
-}
-func remoteHost(address string) string {
-	host, _, err := net.SplitHostPort(address)
-	if err == nil {
-		return host
-	}
-	return address
-}
-func ipInNetworks(ip net.IP, networks []*net.IPNet) bool {
-	for _, network := range networks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }

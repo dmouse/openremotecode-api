@@ -17,6 +17,8 @@ func clearConfigEnvironment(t *testing.T) {
 		"SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
 		"SMTP_FROM_ADDRESS", "SMTP_TLS_MODE",
 		"MAILGUN_API_KEY", "MAILGUN_DOMAIN", "MAILGUN_FROM_ADDRESS", "MAILGUN_REGION",
+		"DISPOSABLE_EMAIL_FILTER", "DISPOSABLE_EMAIL_CACHE_DIR",
+		"DISPOSABLE_EMAIL_DATA_URL", "DISPOSABLE_EMAIL_ALLOW_DOMAINS",
 	} {
 		t.Setenv(key, "")
 	}
@@ -85,6 +87,7 @@ func TestLoadConfigRejectsMalformedSecuritySettings(t *testing.T) {
 	for _, key := range []string{
 		"INSECURE_DEVELOPMENT_COOKIES", "ENABLE_INSECURE_DEVELOPMENT_RELAY",
 		"REGISTRATION_ENABLED", "TRUSTED_PROXY_CIDRS", "PAIRING_CODE_KEY",
+		"DISPOSABLE_EMAIL_FILTER",
 	} {
 		t.Run(key, func(t *testing.T) {
 			clearConfigEnvironment(t)
@@ -154,5 +157,100 @@ func TestLoadConfigProductionFailsClosed(t *testing.T) {
 				t.Fatalf("valid production configuration failed: %v", err)
 			}
 		})
+	}
+}
+
+// The upstream list contains example.com, which every development and test address
+// uses, so the filter must not be on unless someone asks for it there.
+func TestLoadConfigDisposableEmailFilterDefaultsByEnvironment(t *testing.T) {
+	cert, key, _ := transportCertificate(t)
+	for _, test := range []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{name: "development default", env: map[string]string{"APP_ENV": "development"}, want: false},
+		{name: "development opt-in", env: map[string]string{"APP_ENV": "development", "DISPOSABLE_EMAIL_FILTER": "true"}, want: true},
+		{name: "production default", want: true},
+		{name: "production opt-out", env: map[string]string{"DISPOSABLE_EMAIL_FILTER": "false"}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setProductionEnvironment(t, cert, key)
+			for name, value := range test.env {
+				t.Setenv(name, value)
+			}
+			config, err := LoadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.DisposableEmail.Enabled != test.want {
+				t.Fatalf("Enabled = %v, want %v", config.DisposableEmail.Enabled, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigDisposableEmailSettings(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("DISPOSABLE_EMAIL_CACHE_DIR", " /var/cache/disposable-email ")
+	t.Setenv("DISPOSABLE_EMAIL_DATA_URL", " https://lists.example.test/data.bin ")
+	t.Setenv("DISPOSABLE_EMAIL_ALLOW_DOMAINS", " corp.example.test, ,partner.example.test,")
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := config.DisposableEmail
+	if got.CacheDir != "/var/cache/disposable-email" || got.DataURL != "https://lists.example.test/data.bin" ||
+		len(got.AllowDomains) != 2 || got.AllowDomains[0] != "corp.example.test" || got.AllowDomains[1] != "partner.example.test" {
+		t.Fatalf("unexpected disposable email settings: %#v", got)
+	}
+}
+
+func TestLoadConfigRejectsUnsafeDisposableEmailDataURL(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		development bool
+		value       string
+		wantValid   bool
+	}{
+		{name: "https", development: false, value: "https://lists.example.test/data.bin", wantValid: true},
+		{name: "plaintext in production", development: false, value: "http://lists.example.test/data.bin"},
+		{name: "plaintext in development", development: true, value: "http://127.0.0.1:9000/data.bin", wantValid: true},
+		{name: "credentials", development: true, value: "https://user:secret@lists.example.test/data.bin"},
+		{name: "no host", development: true, value: "https:///data.bin"},
+		{name: "file scheme", development: true, value: "file:///etc/passwd"},
+		{name: "relative", development: true, value: "/data.bin"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validDisposableEmailDataURL(test.value, test.development); got != test.wantValid {
+				t.Fatalf("validDisposableEmailDataURL(%q, %v) = %v, want %v", test.value, test.development, got, test.wantValid)
+			}
+		})
+	}
+
+	clearConfigEnvironment(t)
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("DISPOSABLE_EMAIL_DATA_URL", "https://user:secret@lists.example.test/data.bin")
+	_, err := LoadConfig()
+	if err == nil || !strings.Contains(err.Error(), "DISPOSABLE_EMAIL_DATA_URL") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("expected a named error that does not echo the URL, got %v", err)
+	}
+}
+
+// setProductionEnvironment sets the minimum a production LoadConfig accepts. A test
+// then overrides or unsets exactly the settings it is about.
+func setProductionEnvironment(t *testing.T, cert, key string) {
+	t.Helper()
+	for name, value := range map[string]string{
+		"APP_ENV": "production", "TLS_CERT_FILE": cert, "TLS_KEY_FILE": key,
+		"PAIRING_CODE_KEY": strings.Repeat("k", 32), "SERVICE_ID": "test-service",
+		"PAIRING_VERIFICATION_URI": "https://example.test/pair",
+		"SMTP_HOST":                "mail.example.test",
+		"SMTP_FROM_ADDRESS":        "no-reply@example.test",
+	} {
+		t.Setenv(name, value)
 	}
 }

@@ -50,6 +50,7 @@ func RegisterRoutes(config Config, services Services, pool *sql.DB, logger *slog
 			AllowedOrigins:  origins,
 			Logger:          logger,
 			DevelopmentEcho: config.DevelopmentRelayEnabled,
+			Hub:             services.RelayHub,
 		}),
 	}
 

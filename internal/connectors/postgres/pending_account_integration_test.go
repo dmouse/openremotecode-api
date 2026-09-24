@@ -105,6 +105,11 @@ func TestPendingAccountCannotReachConnectorRoutes(t *testing.T) {
 		"HEAD /v1/connectors":                     {provesFixture: true},
 		"POST /v1/connectors/:connectorID/revoke": {body: `{}`, provesFixture: true},
 		"POST /v1/connectors/:connectorID/rename": {body: `{"name":"Renamed"}`, provesFixture: true},
+		// Device inventory and account-owned revocation (ADR 0017). An unknown device is 404
+		// for an active account, which gets it past the identity check.
+		"GET /v1/devices":                   {provesFixture: true},
+		"HEAD /v1/devices":                  {provesFixture: true},
+		"POST /v1/devices/:deviceID/revoke": {body: `{}`, provesFixture: true},
 		// These two answer 401 for an active account as well, each for its own
 		// legitimate reason, so neither can demonstrate the fixture: confirming
 		// reports a pairing that is unknown or not yours as unauthorized rather than
@@ -127,8 +132,10 @@ func TestPendingAccountCannotReachConnectorRoutes(t *testing.T) {
 		"POST /v1/connector-pairings":                   {},
 		"POST /v1/connector-pairings/:pairingID/poll":   {},
 		"POST /v1/connector-pairings/:pairingID/cancel": {},
-		"POST /v1/connectors/self/revoke":               {},
-		"POST /v1/connectors/self/rotate":               {},
+		// Authenticated by the pairing secret only the connector holds (ADR 0018).
+		"POST /v1/connector-pairings/:pairingID/approve": {},
+		"POST /v1/connectors/self/revoke":                {},
+		"POST /v1/connectors/self/rotate":                {},
 		// Authenticated by the pending credential a rotation issued, which is likewise
 		// a connector credential and never an account token.
 		"POST /v1/connectors/self/rotate/activate": {},
@@ -155,6 +162,7 @@ func TestPendingAccountCannotReachConnectorRoutes(t *testing.T) {
 		// Concrete identifiers in place of the route parameters.
 		path = strings.ReplaceAll(path, ":pairingID", "par_unknown_pairing_0001")
 		path = strings.ReplaceAll(path, ":connectorID", "con_unknown_connector_01")
+		path = strings.ReplaceAll(path, ":deviceID", "dev_unknown_device_0001")
 
 		t.Run("pending is rejected by "+key, func(t *testing.T) {
 			response := performAuthorizedRequest(router, method, path, route.body, accessToken)
@@ -178,6 +186,7 @@ func TestPendingAccountCannotReachConnectorRoutes(t *testing.T) {
 		method, path, _ := strings.Cut(key, " ")
 		path = strings.ReplaceAll(path, ":pairingID", "par_unknown_pairing_0001")
 		path = strings.ReplaceAll(path, ":connectorID", "con_unknown_connector_01")
+		path = strings.ReplaceAll(path, ":deviceID", "dev_unknown_device_0001")
 
 		t.Run("active is admitted by "+key, func(t *testing.T) {
 			response := performAuthorizedRequest(router, method, path, route.body, accessToken)

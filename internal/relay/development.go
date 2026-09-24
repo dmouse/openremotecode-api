@@ -31,12 +31,7 @@ const (
 	outboundQueueCapacity = 64
 )
 
-var (
-	keyIDPattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
-	noncePattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
-	base64URLPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	uuidPattern      = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
-)
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 
 type DevelopmentHandler struct {
 	hub      *hub
@@ -152,7 +147,7 @@ func parseHello(message []byte) (helloMessage, error) {
 		return hello, err
 	}
 	if hello.ProtocolVersion != protocolVersion || !validIdentity(hello.Identity) ||
-		!noncePattern.MatchString(hello.Nonce) {
+		!exactBase64URL(hello.Nonce, 22) {
 		return hello, errors.New("invalid hello protocol, identity or nonce")
 	}
 
@@ -186,9 +181,9 @@ func parseEnvelope(message []byte, now time.Time) (relayEnvelope, error) {
 		envelope.Type != "relay.envelope" ||
 		envelope.Suite != hpkeSuiteID ||
 		!uuidPattern.MatchString(envelope.MessageID) ||
-		!keyIDPattern.MatchString(envelope.SenderKeyID) ||
-		!keyIDPattern.MatchString(envelope.RecipientKeyID) ||
-		!keyIDPattern.MatchString(envelope.Epoch) ||
+		!exactBase64URL(envelope.SenderKeyID, 43) ||
+		!exactBase64URL(envelope.RecipientKeyID, 43) ||
+		!exactBase64URL(envelope.Epoch, 43) ||
 		envelope.ExpiresAt <= nowMilliseconds ||
 		envelope.ExpiresAt > now.Add(maxEnvelopeTTL).UnixMilli() ||
 		!validBase64URL(envelope.EncapsulatedKey, 256) ||
@@ -201,12 +196,38 @@ func parseEnvelope(message []byte, now time.Time) (relayEnvelope, error) {
 func validIdentity(identity publicIdentity) bool {
 	return identity.Version == identityVersion &&
 		identity.Suite == hpkeSuiteID &&
-		keyIDPattern.MatchString(identity.KeyID) &&
+		exactBase64URL(identity.KeyID, 43) &&
 		validBase64URL(identity.PublicKey, 1024)
 }
 
+// base64URLAlphabet marks the bytes of unpadded base64url (RFC 4648 §5).
+var base64URLAlphabet = func() (table [256]bool) {
+	for _, character := range []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") {
+		table[character] = true
+	}
+	return table
+}()
+
+// isBase64URL reports whether every byte of value is in the base64url alphabet. Every
+// relayed frame runs its ciphertext through this, so it is a table lookup per byte: a
+// regular expression cost about 60% of relay CPU, and a per-byte switch mispredicts on
+// ciphertext, which never repeats. Bytes of a multi-byte UTF-8 sequence are all >= 0x80
+// and so never in the table.
+func isBase64URL(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if !base64URLAlphabet[value[index]] {
+			return false
+		}
+	}
+	return true
+}
+
 func validBase64URL(value string, maximumLength int) bool {
-	return len(value) > 0 && len(value) <= maximumLength && base64URLPattern.MatchString(value)
+	return len(value) > 0 && len(value) <= maximumLength && isBase64URL(value)
+}
+
+func exactBase64URL(value string, length int) bool {
+	return len(value) == length && isBase64URL(value)
 }
 
 func decodeStrict(message []byte, destination any) error {

@@ -222,13 +222,13 @@ func TestRotationKeepsALiveAdmissionValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.ValidateConnectorAdmission(ctx, admission); err != nil {
+	if err := service.ValidateAdmission(ctx, admission); err != nil {
 		t.Fatalf("pending rotation closed a live connection: %v", err)
 	}
 	if _, err := service.ActivateConnectorCredential(ctx, rotation.Credential); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.ValidateConnectorAdmission(ctx, admission); err != nil {
+	if err := service.ValidateAdmission(ctx, admission); err != nil {
 		t.Fatalf("activation closed a live connection: %v", err)
 	}
 }

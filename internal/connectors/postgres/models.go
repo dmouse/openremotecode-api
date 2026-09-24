@@ -75,6 +75,7 @@ type PairingModel struct {
 	ConnectorKeyID           string                      `gorm:"type:char(43);not null;index:connector_pairings_key_id_idx"`
 	ConnectorPublicKey       string                      `gorm:"type:varchar(1024);not null"`
 	ConnectorCredentialHash  []byte                      `gorm:"type:bytea;check:connector_pairings_credential_hash_length_check,connector_credential_hash IS NULL OR octet_length(connector_credential_hash) = 32"`
+	DeviceCredentialSeed     []byte                      `gorm:"type:bytea;check:connector_pairings_device_credential_seed_length_check,device_credential_seed IS NULL OR octet_length(device_credential_seed) = 32"`
 	State                    string                      `gorm:"type:varchar(16);not null;index:connector_pairings_state_expires_idx,priority:1;check:connector_pairings_state_check,state IN ('pending','verification','confirmed','completed','expired')"`
 	UserID                   *string                     `gorm:"type:varchar(32);index:connector_pairings_user_id_idx"`
 	User                     *identitypostgres.UserModel `gorm:"foreignKey:UserID;constraint:OnUpdate:RESTRICT,OnDelete:CASCADE"`
@@ -131,6 +132,18 @@ type AuditEventModel struct {
 
 func (AuditEventModel) TableName() string { return "connector_audit_events" }
 
+// ClaimFailureModel records one incorrect pairing code. Rows are short lived: each insert
+// drops those older than the longest counting window, so the table holds at most about an
+// hour of failures. It stores no code, guessed or real.
+type ClaimFailureModel struct {
+	ID         uint64                     `gorm:"primaryKey;autoIncrement"`
+	UserID     string                     `gorm:"type:varchar(32);not null;index:pairing_claim_failures_user_occurred_idx,priority:1"`
+	User       identitypostgres.UserModel `gorm:"foreignKey:UserID;constraint:OnUpdate:RESTRICT,OnDelete:CASCADE"`
+	OccurredAt time.Time                  `gorm:"type:timestamptz;not null;index:pairing_claim_failures_user_occurred_idx,priority:2;index:pairing_claim_failures_occurred_idx"`
+}
+
+func (ClaimFailureModel) TableName() string { return "pairing_claim_failures" }
+
 func Migrate(ctx context.Context, database *gorm.DB) error {
 	return database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		if err := transaction.AutoMigrate(
@@ -141,6 +154,7 @@ func Migrate(ctx context.Context, database *gorm.DB) error {
 			&TrustModel{},
 			&RelayTicketModel{},
 			&AuditEventModel{},
+			&ClaimFailureModel{},
 		); err != nil {
 			return err
 		}
