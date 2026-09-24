@@ -55,12 +55,12 @@ type Handler struct {
 	registrationEnabled bool
 	logger              *slog.Logger
 	now                 func() time.Time
-	registerLimiter     *fixedWindowLimiter
-	loginLimiter        *fixedWindowLimiter
-	googleLimiter       *fixedWindowLimiter
-	refreshLimiter      *fixedWindowLimiter
-	verifyEmailLimiter  *fixedWindowLimiter
-	resendLimiter       *fixedWindowLimiter
+	registerLimiter     *httpserver.RateLimiter
+	loginLimiter        *httpserver.RateLimiter
+	googleLimiter       *httpserver.RateLimiter
+	refreshLimiter      *httpserver.RateLimiter
+	verifyEmailLimiter  *httpserver.RateLimiter
+	resendLimiter       *httpserver.RateLimiter
 }
 
 func NewHandler(service AuthenticationService, config Config) *Handler {
@@ -78,38 +78,20 @@ func NewHandler(service AuthenticationService, config Config) *Handler {
 		registrationEnabled: config.RegistrationEnabled,
 		logger:              config.Logger,
 		now:                 config.Now,
-		registerLimiter: newFixedWindowLimiter(rateLimit{
-			maximum: 5,
-			window:  10 * time.Minute,
-		}),
-		loginLimiter: newFixedWindowLimiter(rateLimit{
-			maximum: 10,
-			window:  time.Minute,
-		}),
+		registerLimiter:     httpserver.NewRateLimiter(5, 10*time.Minute),
+		loginLimiter:        httpserver.NewRateLimiter(10, time.Minute),
 		// Sized like login rather than register. The route both signs in and creates
 		// accounts, but every request carries an assertion Google already charged the
 		// caller to obtain, so the account-creation half needs no tighter bound than
 		// the sign-in half. It still needs its own limiter: sharing login's would let
 		// either route exhaust the other's budget.
-		googleLimiter: newFixedWindowLimiter(rateLimit{
-			maximum: 10,
-			window:  time.Minute,
-		}),
-		refreshLimiter: newFixedWindowLimiter(rateLimit{
-			maximum: 30,
-			window:  time.Minute,
-		}),
+		googleLimiter:  httpserver.NewRateLimiter(10, time.Minute),
+		refreshLimiter: httpserver.NewRateLimiter(30, time.Minute),
 		// Layered on top of the service-side attempt cap, which is per challenge;
 		// this one bounds guessing across challenges from one address.
-		verifyEmailLimiter: newFixedWindowLimiter(rateLimit{
-			maximum: 10,
-			window:  10 * time.Minute,
-		}),
+		verifyEmailLimiter: httpserver.NewRateLimiter(10, 10*time.Minute),
 		// Layered on top of the service-side resend cooldown, which is per challenge.
-		resendLimiter: newFixedWindowLimiter(rateLimit{
-			maximum: 3,
-			window:  10 * time.Minute,
-		}),
+		resendLimiter: httpserver.NewRateLimiter(3, 10*time.Minute),
 	}
 	if config.CookieSecure {
 		handler.cookieName = secureRefreshCookieName
@@ -143,11 +125,11 @@ func (handler *Handler) RegisterRoutes(router gin.IRouter) {
 
 // protected attaches the origin gate and (optional) rate limiter for an auth route,
 // keeping the route table readable as "limiter, handler".
-func (handler *Handler) protected(limiter *fixedWindowLimiter, next http.HandlerFunc) gin.HandlerFunc {
+func (handler *Handler) protected(limiter *httpserver.RateLimiter, next http.HandlerFunc) gin.HandlerFunc {
 	return httpserver.WrapHandler(handler.protect(limiter, next))
 }
 
-func (handler *Handler) protect(limiter *fixedWindowLimiter, next http.Handler) http.Handler {
+func (handler *Handler) protect(limiter *httpserver.RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		origin := request.Header.Get("Origin")
 		if origin != "" {
@@ -161,8 +143,8 @@ func (handler *Handler) protect(limiter *fixedWindowLimiter, next http.Handler) 
 			return
 		}
 		if limiter != nil {
-			allowed, retryAfter := limiter.allow(
-				clientAddress(request, handler.trustedProxies),
+			allowed, retryAfter := limiter.Allow(
+				httpserver.RateLimitKey(request, handler.trustedProxies),
 				handler.now(),
 			)
 			if !allowed {
@@ -363,6 +345,10 @@ func (handler *Handler) writeServiceError(
 	switch {
 	case errors.Is(err, identity.ErrInvalidInput):
 		writeError(response, http.StatusBadRequest, "invalid_request", "Request is invalid")
+	// Names the recovery path rather than failing blank. The verdict depends on the
+	// domain alone, so it says nothing about whether an account exists.
+	case errors.Is(err, identity.ErrDisposableEmail):
+		writeError(response, http.StatusBadRequest, "disposable_email", "Disposable email addresses are not accepted. Use a permanent address.")
 	case errors.Is(err, identity.ErrInvalidVerificationCode):
 		writeError(response, http.StatusBadRequest, "invalid_verification_code", "Verification code is invalid or expired")
 	case errors.Is(err, identity.ErrVerificationThrottled):
@@ -525,48 +511,6 @@ func bearerToken(request *http.Request) (string, error) {
 		return "", identity.ErrUnauthorized
 	}
 	return parts[1], nil
-}
-
-func clientAddress(request *http.Request, trustedProxies []*net.IPNet) string {
-	peer := remoteHost(request.RemoteAddr)
-	peerIP := net.ParseIP(peer)
-	if peerIP == nil || !ipInNetworks(peerIP, trustedProxies) {
-		return peer
-	}
-
-	forwardedFor := request.Header.Values("X-Forwarded-For")
-	if len(forwardedFor) != 1 {
-		return peer
-	}
-	addresses := strings.Split(forwardedFor[0], ",")
-	for index := len(addresses) - 1; index >= 0; index-- {
-		address := strings.TrimSpace(addresses[index])
-		ip := net.ParseIP(address)
-		if ip == nil {
-			return peer
-		}
-		if !ipInNetworks(ip, trustedProxies) {
-			return address
-		}
-	}
-	return peer
-}
-
-func remoteHost(address string) string {
-	host, _, err := net.SplitHostPort(address)
-	if err == nil {
-		return host
-	}
-	return address
-}
-
-func ipInNetworks(ip net.IP, networks []*net.IPNet) bool {
-	for _, network := range networks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func writeError(response http.ResponseWriter, status int, code, message string) {

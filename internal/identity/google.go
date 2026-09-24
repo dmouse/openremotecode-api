@@ -208,9 +208,17 @@ func (service *Service) googleLinkExisting(
 		// Google proved control of the address, which is what the mailed code exists
 		// to prove. Completing the pending verification here is strictly stronger
 		// than leaving the account stranded behind a code it may never receive.
-		// ActivateUser's pending-only WHERE clause is what keeps this branch from
-		// ever touching an account in another state.
-		if err := store.ActivateUser(ctx, user.ID, now); err != nil {
+		//
+		// The password does not survive, though. Anyone can register a pending
+		// account for an address they do not control, so the password on it proves
+		// nothing about the person Google just vouched for. Keeping it would let
+		// whoever pre-registered the address sign in to the account its real owner
+		// is about to use. A pending account never holds a session, so there is
+		// nothing else to revoke; the owner can set a password later.
+		//
+		// The pending-only WHERE clause is what keeps this branch from ever touching
+		// an account in another state.
+		if err := store.ActivateFederatedUser(ctx, user.ID, now); err != nil {
 			return googleOutcome{}, err
 		}
 		if err := store.DeleteEmailVerification(ctx, user.ID); err != nil {

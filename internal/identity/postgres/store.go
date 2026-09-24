@@ -372,6 +372,30 @@ func (store *transactionStore) ActivateUser(
 	return nil
 }
 
+// ActivateFederatedUser promotes a pending account and clears its password hash in
+// one statement, under the same pending-only WHERE clause as ActivateUser.
+func (store *transactionStore) ActivateFederatedUser(
+	ctx context.Context,
+	userID string,
+	verifiedAt time.Time,
+) error {
+	result := store.database.WithContext(ctx).
+		Model(&UserModel{}).
+		Where("id = ? AND status = ?", userID, identity.AccountStatusPending).
+		Updates(map[string]any{
+			"status":            identity.AccountStatusActive,
+			"email_verified_at": verifiedAt,
+			"password_hash":     gorm.Expr("NULL"),
+		})
+	if result.Error != nil {
+		return translateError(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return identity.ErrNotFound
+	}
+	return nil
+}
+
 func (store *transactionStore) RefreshCredentialForUpdate(
 	ctx context.Context,
 	tokenHash []byte,

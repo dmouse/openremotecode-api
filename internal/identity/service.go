@@ -35,18 +35,29 @@ type ServiceOptions struct {
 	// AuthenticateWithGoogle then answers ErrGoogleUnavailable rather than pretending
 	// every assertion is invalid, which would be indistinguishable from a bug.
 	GoogleVerifier GoogleVerifier
+	// DisposableEmails, when set, makes Register refuse throwaway-mail domains. It is
+	// deliberately not applied to sign-in or to Google accounts: an existing account
+	// must always be able to authenticate, and Google has already vouched for the
+	// address it asserts.
+	DisposableEmails DisposableEmailDetector
+	// OnSessionRevoked is told about each committed session revocation, so relay sockets
+	// admitted under that session can be closed at once. accountInactive is true when the
+	// session ended because the account is no longer active.
+	OnSessionRevoked func(userID, sessionID string, accountInactive bool)
 }
 
 type Service struct {
-	repository      Repository
-	passwords       Passwords
-	mailer          Mailer
-	googleVerifier  GoogleVerifier
-	now             func() time.Time
-	random          io.Reader
-	accessLifetime  time.Duration
-	refreshLifetime time.Duration
-	dummyHash       string
+	repository       Repository
+	passwords        Passwords
+	mailer           Mailer
+	googleVerifier   GoogleVerifier
+	disposableEmails DisposableEmailDetector
+	onSessionRevoked func(userID, sessionID string, accountInactive bool)
+	now              func() time.Time
+	random           io.Reader
+	accessLifetime   time.Duration
+	refreshLifetime  time.Duration
+	dummyHash        string
 }
 
 func NewService(
@@ -67,20 +78,25 @@ func NewService(
 	if options.RefreshLifetime <= 0 {
 		options.RefreshLifetime = defaultRefreshLifetime
 	}
+	if options.OnSessionRevoked == nil {
+		options.OnSessionRevoked = func(string, string, bool) {}
+	}
 	dummyHash, err := passwords.Hash(context.Background(), "invalid-account-password")
 	if err != nil {
 		return nil, err
 	}
 	return &Service{
-		repository:      repository,
-		passwords:       passwords,
-		mailer:          mailer,
-		googleVerifier:  options.GoogleVerifier,
-		now:             options.Now,
-		random:          options.Random,
-		accessLifetime:  options.AccessLifetime,
-		refreshLifetime: options.RefreshLifetime,
-		dummyHash:       dummyHash,
+		repository:       repository,
+		passwords:        passwords,
+		mailer:           mailer,
+		googleVerifier:   options.GoogleVerifier,
+		disposableEmails: options.DisposableEmails,
+		onSessionRevoked: options.OnSessionRevoked,
+		now:              options.Now,
+		random:           options.Random,
+		accessLifetime:   options.AccessLifetime,
+		refreshLifetime:  options.RefreshLifetime,
+		dummyHash:        dummyHash,
 	}, nil
 }
 
@@ -94,6 +110,12 @@ func (service *Service) Register(
 	email, normalizedEmail, err := normalizeEmail(input.Email)
 	if err != nil || !validRegistrationPassword(input.Password) {
 		return AuthOutcome{}, ErrInvalidInput
+	}
+	// Ahead of the hash and the transaction so a rejected address costs nothing, and
+	// ahead of the duplicate handling because the verdict cannot depend on account
+	// state without becoming an oracle.
+	if service.disposableEmails != nil && service.disposableEmails.IsDisposable(email) {
+		return AuthOutcome{}, ErrDisposableEmail
 	}
 	clientName, err := normalizeClientName(input.ClientName)
 	if err != nil {
@@ -470,6 +492,9 @@ func (service *Service) Refresh(
 	accessExpiresAt := now.Add(service.accessLifetime)
 	var credentials Credentials
 	valid := false
+	// Set when this call revokes a session; reported only once the revocation has committed.
+	var revoked *Session
+	accountInactive := false
 
 	err = service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
 		refresh, err := store.RefreshCredentialForUpdate(ctx, hashToken(refreshToken))
@@ -492,6 +517,7 @@ func (service *Service) Refresh(
 				if err := store.RevokeSession(ctx, session.ID, now); err != nil {
 					return err
 				}
+				revoked = &session
 				if err := store.AppendAuditEvent(ctx, auditEvent(
 					"auth.refresh_reuse_detected",
 					session.UserID,
@@ -507,6 +533,7 @@ func (service *Service) Refresh(
 			!refresh.ExpiresAt.After(now) ||
 			!session.RefreshExpiresAt.After(now) {
 			if session.RevokedAt == nil {
+				revoked = &session
 				return store.RevokeSession(ctx, session.ID, now)
 			}
 			return nil
@@ -517,6 +544,7 @@ func (service *Service) Refresh(
 			return err
 		}
 		if user.Status != AccountStatusActive {
+			revoked, accountInactive = &session, true
 			return store.RevokeSession(ctx, session.ID, now)
 		}
 		if err := store.MarkRefreshCredentialUsed(ctx, refresh.TokenHash, now); err != nil {
@@ -561,6 +589,9 @@ func (service *Service) Refresh(
 	if err != nil {
 		return Credentials{}, err
 	}
+	if revoked != nil {
+		service.onSessionRevoked(revoked.UserID, revoked.ID, accountInactive)
+	}
 	if !valid {
 		return Credentials{}, ErrInvalidRefresh
 	}
@@ -572,7 +603,8 @@ func (service *Service) Logout(ctx context.Context, refreshToken string) error {
 		return nil
 	}
 	now := service.now().UTC()
-	return service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
+	var revoked *Session
+	err := service.repository.WithinTransaction(ctx, func(store TransactionStore) error {
 		refresh, err := store.RefreshCredentialForUpdate(ctx, hashToken(refreshToken))
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -590,6 +622,7 @@ func (service *Service) Logout(ctx context.Context, refreshToken string) error {
 		if err := store.RevokeSession(ctx, session.ID, now); err != nil {
 			return err
 		}
+		revoked = &session
 		return store.AppendAuditEvent(ctx, auditEvent(
 			"auth.logout_succeeded",
 			session.UserID,
@@ -597,6 +630,10 @@ func (service *Service) Logout(ctx context.Context, refreshToken string) error {
 			now,
 		))
 	})
+	if err == nil && revoked != nil {
+		service.onSessionRevoked(revoked.UserID, revoked.ID, false)
+	}
+	return err
 }
 
 func (service *Service) CurrentAccount(

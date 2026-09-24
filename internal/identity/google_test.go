@@ -266,13 +266,17 @@ func TestGoogleSignInCompletesPendingVerification(t *testing.T) {
 	}); !errors.Is(err, ErrInvalidVerificationCode) {
 		t.Fatal("the superseded verification ticket must no longer work")
 	}
-	// The account keeps the password it registered with; both paths now reach it.
+	// The password chosen at registration never proved the address, so it is discarded:
+	// otherwise whoever pre-registered the address could sign in to the owner's account.
+	if fixture.repository.users[credentials.Account.ID].HasPassword() {
+		t.Fatal("google activation must discard the pending account's password")
+	}
 	if _, err := fixture.service.Login(context.Background(), LoginInput{
 		Email:      "person@example.com",
 		Password:   "correct horse battery staple",
 		ClientName: "Test client",
-	}); err != nil {
-		t.Fatalf("password login after google activation: %v", err)
+	}); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("password login after google activation = %v, want ErrInvalidCredentials", err)
 	}
 }
 

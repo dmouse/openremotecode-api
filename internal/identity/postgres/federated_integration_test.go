@@ -77,6 +77,58 @@ func TestFederatedAccountStoresNoPasswordHash(t *testing.T) {
 	}
 }
 
+// A provider completing a pending account's verification must also discard the
+// password it was registered with: whoever chose it never proved the address. The
+// same pending-only guard as ActivateUser must keep it off any other account.
+func TestActivateFederatedUserDiscardsPendingPassword(t *testing.T) {
+	isolatedDatabase := newIsolatedDatabase(t)
+	store := identitypostgres.NewStore(isolatedDatabase)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	passwordHash := "registered-password-hash"
+	if err := isolatedDatabase.Create(&identitypostgres.UserModel{
+		ID:              "usr_pending_account_0001",
+		Email:           "person@example.com",
+		NormalizedEmail: "person@example.com",
+		PasswordHash:    &passwordHash,
+		Status:          identity.AccountStatusPending,
+		CreatedAt:       now,
+	}).Error; err != nil {
+		t.Fatalf("seed pending user: %v", err)
+	}
+	seedFederatedUser(t, isolatedDatabase, "usr_active_account_00001", "active@example.com", &passwordHash, now)
+
+	err := store.WithinTransaction(context.Background(), func(transaction identity.TransactionStore) error {
+		return transaction.ActivateFederatedUser(context.Background(), "usr_pending_account_0001", now)
+	})
+	if err != nil {
+		t.Fatalf("activate pending account: %v", err)
+	}
+	activated, err := store.UserByNormalizedEmail(context.Background(), "person@example.com")
+	if err != nil {
+		t.Fatalf("load activated account: %v", err)
+	}
+	if activated.Status != identity.AccountStatusActive || activated.EmailVerifiedAt == nil {
+		t.Fatalf("account not activated: %+v", activated.Account)
+	}
+	if activated.HasPassword() {
+		t.Fatal("federated activation must clear the pending account's password hash")
+	}
+
+	err = store.WithinTransaction(context.Background(), func(transaction identity.TransactionStore) error {
+		return transaction.ActivateFederatedUser(context.Background(), "usr_active_account_00001", now)
+	})
+	if !errors.Is(err, identity.ErrNotFound) {
+		t.Fatalf("activate active account = %v, want ErrNotFound", err)
+	}
+	untouched, err := store.UserByNormalizedEmail(context.Background(), "active@example.com")
+	if err != nil {
+		t.Fatalf("load active account: %v", err)
+	}
+	if !untouched.HasPassword() {
+		t.Fatal("federated activation must not touch an account that is not pending")
+	}
+}
+
 // newIsolatedDatabase migrates a fresh schema, where password_hash is created
 // nullable from the start. A real deployment instead has the column already there
 // and NOT NULL, so this reconstructs that shape and checks the migration alters it

@@ -6,6 +6,7 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/mailgun/mailgun-go/v5 v5.19.3
+	github.com/rezmoss/go-is-disposable-email v0.0.12
 	github.com/spf13/viper v1.21.0
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.297.0

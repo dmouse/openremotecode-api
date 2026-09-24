@@ -15,7 +15,20 @@ var (
 	ErrNotFound                = errors.New("identity record not found")
 	ErrUnauthorized            = errors.New("unauthorized")
 	ErrVerificationThrottled   = errors.New("verification code was requested too recently")
+	// ErrDisposableEmail is returned by Register for an address on a throwaway-mail
+	// domain. It is an explicit error rather than ErrInvalidInput because the caller
+	// can act on it by choosing another address. It reveals nothing about accounts:
+	// the verdict depends only on the domain, never on whether the address is taken.
+	ErrDisposableEmail = errors.New("email domain is a disposable mail provider")
 )
+
+// DisposableEmailDetector reports whether an address belongs to a disposable-mail
+// domain. The service treats a nil detector as "no policy", and an implementation
+// that cannot decide must answer false: the check is a spam filter, so an outage in
+// whatever backs it must never stop a legitimate person from registering.
+type DisposableEmailDetector interface {
+	IsDisposable(email string) bool
+}
 
 // Federated sign-in failures. They are separated from ErrInvalidCredentials because
 // each says something different to the client, and only one of them is recoverable.
@@ -252,6 +265,10 @@ type TransactionStore interface {
 	IncrementEmailVerificationAttempts(context.Context, string) error
 	DeleteEmailVerification(context.Context, string) error
 	ActivateUser(context.Context, string, time.Time) error
+	// ActivateFederatedUser promotes a pending account whose address a provider has
+	// just proved, discarding its password hash in the same write. Whoever chose that
+	// password never proved the address, so it must not survive the activation.
+	ActivateFederatedUser(context.Context, string, time.Time) error
 	RefreshCredentialForUpdate(context.Context, []byte) (RefreshCredential, error)
 	SessionForUpdate(context.Context, string) (Session, error)
 	UserByID(context.Context, string) (User, error)

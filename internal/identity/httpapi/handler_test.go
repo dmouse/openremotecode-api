@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -301,25 +300,6 @@ func TestSecureRefreshCookieIsHostBound(t *testing.T) {
 	}
 }
 
-func TestClientAddressTrustsOnlyConfiguredProxies(t *testing.T) {
-	_, trustedProxy, err := net.ParseCIDR("10.0.0.0/8")
-	if err != nil {
-		t.Fatalf("parse trusted proxy: %v", err)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/v1/auth/login", nil)
-	request.RemoteAddr = "192.0.2.10:1234"
-	request.Header.Set("X-Forwarded-For", "198.51.100.7")
-	if address := clientAddress(request, []*net.IPNet{trustedProxy}); address != "192.0.2.10" {
-		t.Fatalf("untrusted peer spoofed client address as %q", address)
-	}
-
-	request.RemoteAddr = "10.0.0.4:1234"
-	request.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.3")
-	if address := clientAddress(request, []*net.IPNet{trustedProxy}); address != "198.51.100.7" {
-		t.Fatalf("expected forwarded client address, got %q", address)
-	}
-}
-
 func TestHandlerReturnsGenericInternalError(t *testing.T) {
 	service := &failingAuthenticationService{stubAuthenticationService: stubAuthenticationService{}}
 	handler := newTestHandler(service, Config{AllowedOrigins: []string{"http://app.test"}})
@@ -338,6 +318,36 @@ func TestHandlerReturnsGenericInternalError(t *testing.T) {
 	}
 	if strings.Contains(response.Body.String(), "sensitive") {
 		t.Fatalf("response leaked internal error: %s", response.Body.String())
+	}
+}
+
+func TestRegisterMapsDisposableEmailToAnActionableError(t *testing.T) {
+	service := &stubAuthenticationService{err: identity.ErrDisposableEmail}
+	handler := newTestHandler(service, Config{
+		AllowedOrigins:      []string{"http://app.test"},
+		RegistrationEnabled: true,
+	})
+
+	response := performRequest(
+		handler,
+		"/v1/auth/register",
+		`{"email":"person@burner.test","password":"a secure password","clientName":"Mobile"}`,
+	)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusBadRequest, response.Body)
+	}
+	var document struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if document.Code != "disposable_email" {
+		t.Fatalf("code = %q, want disposable_email", document.Code)
+	}
+	if cookies := response.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("rejection set %d cookies", len(cookies))
 	}
 }
 

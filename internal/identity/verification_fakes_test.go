@@ -331,6 +331,20 @@ func (repository *memoryRepository) ActivateUser(
 	return nil
 }
 
+func (repository *memoryRepository) ActivateFederatedUser(
+	ctx context.Context,
+	userID string,
+	verifiedAt time.Time,
+) error {
+	if err := repository.ActivateUser(ctx, userID, verifiedAt); err != nil {
+		return err
+	}
+	user := repository.users[userID]
+	user.PasswordHash = nil
+	repository.users[userID] = user
+	return nil
+}
+
 func (repository *memoryRepository) RefreshCredentialForUpdate(
 	_ context.Context,
 	tokenHash []byte,
@@ -570,6 +584,13 @@ type verificationFixture struct {
 	mailer     *fakeMailer
 	google     *fakeGoogleVerifier
 	now        time.Time
+	// revocations records each session revocation the service announced after committing.
+	revocations []announcedRevocation
+}
+
+type announcedRevocation struct {
+	userID, sessionID string
+	accountInactive   bool
 }
 
 func newVerificationFixture(t interface{ Fatalf(string, ...any) }) *verificationFixture {
@@ -595,6 +616,9 @@ func newFixture(
 	options := ServiceOptions{
 		Now:    func() time.Time { return fixture.now },
 		Random: &countingRandom{},
+		OnSessionRevoked: func(userID, sessionID string, accountInactive bool) {
+			fixture.revocations = append(fixture.revocations, announcedRevocation{userID, sessionID, accountInactive})
+		},
 	}
 	// Assigning a nil *fakeGoogleVerifier to the interface field would produce a
 	// non-nil interface holding a nil pointer, which is exactly the state the
