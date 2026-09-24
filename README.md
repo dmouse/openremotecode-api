@@ -109,12 +109,14 @@ Registration creates a `pending` account and mails it a six-digit code; only `PO
 
 Passwords use Argon2id with the RFC 9106 low-memory recommendation. Access credentials are opaque, short lived, and kept out of cookies. Refresh credentials are hashed in PostgreSQL, rotate on every use, and use the existing HTTP-only, SameSite Strict cookie contract. The native client extracts the credential into secure storage and forwards it explicitly to the same server; it does not use a browser cookie jar. Reusing a rotated refresh credential revokes the entire auth session.
 
-Pairing challenges are single use. Pairing secrets, human codes, mobile device credentials, connector credentials, and relay tickets are stored only as hashes. Both mobile and connector identities prove possession with standard P-256 ECDSA/SHA-256 signatures. The connector must poll and observe the stable transcript before confirmation. Confirmation idempotently creates the account-scoped trust edge and installs both durable credentials in one transaction.
+Pairing challenges are single use. Pairing secrets, human codes, mobile device credentials, connector credentials, and relay tickets are stored only as hashes. Both mobile and connector identities prove possession with standard P-256 ECDSA/SHA-256 signatures. The connector must observe the stable transcript and the person at OpenCode must explicitly approve the device, after comparing the safety code, before confirmation can succeed; see [ADR 0018](docs/adr/0018-connector-pairing-approval.md). Confirmation idempotently creates the account-scoped trust edge and installs both durable credentials in one transaction.
 
 A connector renews its 90-day credential without re-pairing. Rotation issues a replacement that grants nothing until the connector activates it, so a plugin that never persists or never activates the new value keeps working on its current one; connecting on the current credential instead cancels the pending rotation, and an unactivated rotation lapses after fifteen minutes without invalidating anything. The renewed lifetime starts at activation. Rotation is not revocation and does not close a live relay connection, since admission resolves the connector by ID rather than by credential value. Device credentials rotate the same way, with the same provisional-until-activated semantics; the
 replacement is returned in the body and only becomes a cookie once activated, so the credential the
 client still needs is never overwritten. Device rotation is authenticated by the account session,
 the device ID and the current device cookie together, exactly as relay-ticket issuance is.
+
+Each confirmation issues a fresh device credential derived from a random per-pairing seed ([ADR 0018](docs/adr/0018-connector-pairing-approval.md)), so a retried confirmation returns the same value but re-pairing never restores an old one.
 
 `DEVICE_CREDENTIAL_KEY` derives device credentials and is separate from `PAIRING_CODE_KEY`, which
 hashes user codes; it is seeded from `PAIRING_CODE_KEY` when unset, so an existing deployment keeps
@@ -128,6 +130,8 @@ and [ADR 0013](docs/adr/0013-device-credential-rotation.md).
 Compose explicitly enables insecure cookies and the legacy unauthenticated relay under `APP_ENV=development`. It leaves `SMTP_HOST` unset, which selects the development mailer that writes verification codes to the server log rather than sending them — read the code from `docker compose logs server`. Mobile and plugin connections use the authenticated `/v1/relay` path. Launch the local plugin with `OPENCODE_REMOTE_ALLOW_INSECURE_LOOPBACK=true opencode` to opt into the development stack's HTTP/WS transport. Outside this development stack, development features are disabled and cookies default to `Secure` host-bound names. Production startup requires a secret `PAIRING_CODE_KEY`, stable `SERVICE_ID`, HTTPS `PAIRING_VERIFICATION_URI`, working SMTP settings as described below, and valid TLS certificate files. Trust only forwarding proxies that sanitize and append headers.
 
 Registration is enabled by default in every environment. `REGISTRATION_ENABLED=false` is an operational kill switch, not a security control; a malformed value stops startup rather than silently closing the route. It governs the mailed-code flow only and does not affect Google sign-in.
+
+Registration also refuses addresses on disposable-mail domains, using the list from [`go-is-disposable-email`](https://github.com/rezmoss/go-is-disposable-email) (HTTP 400, code `disposable_email`). Sign-in and Google sign-in are not filtered. `DISPOSABLE_EMAIL_FILTER` defaults to on in production and off in development, because the upstream list includes `example.com`; a malformed value stops startup. The list is not embedded: it is downloaded over HTTPS in the background and cached in `DISPOSABLE_EMAIL_CACHE_DIR`, which must be writable (the production compose file mounts a tmpfs there). Until it has loaded, or if it cannot be fetched, registration proceeds unfiltered and a warning is logged, so this never makes registration unavailable. `DISPOSABLE_EMAIL_DATA_URL` points at a self-hosted copy (HTTPS, no credentials) and `DISPOSABLE_EMAIL_ALLOW_DOMAINS` lists comma-separated domains to exempt, subdomains included. See [ADR 0016](docs/adr/0016-disposable-email-filter.md).
 
 ## Google Sign-In
 
@@ -172,7 +176,11 @@ short code. See [the mobile-only client decision](docs/adr/0006-mobile-only-clie
 
 Relay tickets are short lived and atomically consumed before upgrade. Existing sockets have a maximum five-minute authorization lease, capped by session and durable-credential expiry. Clients reconnect with a fresh ticket, which rechecks active account, session, device, connector, and trust state.
 
-Connectors can revoke their own authorization from OpenCode's `/remote` dialog. Revocation immediately prevents new tickets and use of unconsumed tickets. Active connector sockets also revalidate authorization every second, with a one-second check timeout, so idle sockets close after revocation. See `docs/adr/0003-connector-self-revocation.md` for failure behavior and the threat analysis.
+An account can revoke any of its client devices, such as a lost phone, with `POST /v1/devices/{deviceID}/revoke`; `GET /v1/devices` lists them. The device credential, its trust relationships and unused tickets end immediately. See `docs/adr/0017-account-device-revocation.md`.
+
+Revoking a connector or device, logging out, and refresh-token reuse close the affected live relay sockets as soon as the revocation commits. Each socket is also rechecked immediately after it registers and then about every 30 seconds (jittered) as a safety net for changes that are not announced, such as an account disabled directly in the database; only an authorization failure closes it, while a transient database error is retried within the five-minute authorization lease. See `docs/adr/0021-event-driven-relay-revocation.md`.
+
+Connectors can revoke their own authorization from OpenCode's `/remote` dialog. Revocation immediately prevents new tickets and use of unconsumed tickets, and closes the connector's live sockets. See `docs/adr/0003-connector-self-revocation.md` for failure behavior and the threat analysis.
 
 ## Production TLS
 
@@ -238,3 +246,27 @@ the end. They cover authentication/refresh rotation, account isolation, pairing,
 single-use tickets, and a real WebSocket upgrade and revocation through Gin.
 The development image includes GCC and musl headers for Go's race detector;
 rebuild it with `docker compose up --build -d server` after updating the Dockerfile.
+
+## Load Testing
+
+`cmd/loadtest` drives a running server with simulated connector/phone pairs through the
+real ticket and relay admission path and reports connect latency, round-trip percentiles,
+throughput, server-closed sockets, server CPU and memory, and PostgreSQL transaction rate.
+It seeds accounts and credentials directly, so it refuses any non-loopback database: run it
+only against a disposable PostgreSQL, never the development volume. The server must trust
+loopback as a proxy so each simulated pair is rate limited as its own client:
+
+```sh
+docker run -d --rm --name orc-loadtest-postgres -p 127.0.0.1:55432:5432 --tmpfs /var/lib/postgresql \
+  -e POSTGRES_DB=opencode_remote -e POSTGRES_USER=opencode_remote -e POSTGRES_PASSWORD=loadtest-only \
+  postgres:18.6-alpine3.24
+DB='postgres://opencode_remote:loadtest-only@127.0.0.1:55432/opencode_remote?sslmode=disable'
+APP_ENV=development HTTP_ADDR=127.0.0.1:18080 DATABASE_URL="$DB" INSECURE_DEVELOPMENT_COOKIES=true \
+  TRUSTED_PROXY_CIDRS=127.0.0.1/32 go run ./cmd/server &
+go run ./cmd/loadtest -database-url "$DB" -pairs 1000 -rate 1 -duration 60s -server-pid "$(pgrep -n server)"
+docker stop orc-loadtest-postgres
+```
+
+Keep `-duration` under the five-minute relay authorization lease; the harness does not
+reconnect. Results and the capacity limits they revealed are in
+[ADR 0020](docs/adr/0020-relay-load-test-and-pool-separation.md).

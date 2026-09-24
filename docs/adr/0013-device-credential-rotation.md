@@ -56,7 +56,7 @@ call site, which is exactly the problem.
   and on load the pending credential is tried first.
 - The mobile client renews once the credential is inside its final third — roughly day 245 —
   after a successful authenticated call, single-flight, with failure non-fatal.
-- Initial issuance keeps the existing derivation, so confirmation stays idempotent. After a
+- (Superseded by [ADR 0018](0018-connector-pairing-approval.md): initial issuance now derives from a random per-pairing seed, keeping idempotency without deriving from the public key ID.) Initial issuance keeps the existing derivation, so confirmation stays idempotent. After a
   device's first rotation its credential is random and derives from no server key at all, which
   makes the `deviceCredentialKey` dependency transient rather than permanent.
 

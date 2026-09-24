@@ -26,7 +26,7 @@ credential-lifetime control into slow erosion of the one check the pairing desig
 Both credentials are deterministic derivations rather than random values:
 
 - `deriveConnectorCredential` is `HMAC-SHA256(pairingSecret, "opencode-remote/connector-credential/v1")`.
-- `deriveDeviceCredential` is `HMAC-SHA256(serverPairingCodeKey, "opencode-remote/device-credential/v1\0" || keyId)`.
+- `deriveDeviceCredential` is `HMAC-SHA256(serverPairingCodeKey, "opencode-remote/device-credential/v1\0" || keyId)`. (Superseded by [ADR 0018](0018-connector-pairing-approval.md): the input is now a random per-pairing seed.)
 
 Determinism is load-bearing in both cases, which is why rotation cannot simply issue a new
 value. The connector derivation lets a plugin whose setup was interrupted re-derive its

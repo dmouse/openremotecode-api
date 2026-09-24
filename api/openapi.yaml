@@ -1,0 +1,1468 @@
+openapi: 3.1.0
+info:
+  title: Open Remote Code API
+  version: 1.0.0
+  description: Account, connector pairing, device trust, and relay admission API for Open Remote Code.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:8080
+    description: Loopback development server
+paths:
+  /v1/auth/register:
+    post:
+      operationId: register
+      summary: Register an account and start email verification
+      description: >-
+        Creates a pending account and mails it a six-digit verification code. No
+        session is issued and no refresh cookie is set: the account cannot
+        authenticate anywhere until POST /v1/auth/verify-email activates it.
+
+        An address that is already registered is answered identically — the same
+        status and the same response shape, with a verification ticket that is backed
+        by no challenge — so that this endpoint cannot be used to discover whether an
+        account exists. The owner of the address is notified by mail instead. A code
+        submitted against such a ticket fails as an ordinary invalid code.
+
+        Mail delivery happens after the account is committed, so a delivery failure
+        still returns 201; the account is recoverable through resend-verification or
+        by signing in again.
+
+        When the deployment enables its disposable-email filter, an address on a
+        throwaway-mail domain is refused with 400 and the error code
+        `disposable_email`. The verdict depends only on the domain, never on whether
+        the address is already registered, so it does not weaken the guarantee above.
+        Sign-in and Google sign-in are not filtered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account pending email verification
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerificationChallenge"
+        "400":
+          description: >-
+            Request validation failed, or the address is on a disposable-mail domain
+            (error code `disposable_email`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/login:
+    post:
+      operationId: login
+      summary: Authenticate and start a session
+      description: >-
+        Returns credentials and a refresh cookie for an active account. For an
+        account still pending email verification, returns a verification challenge
+        instead and sets no cookie — safe because the caller has already proved the
+        password. Within the resend cooldown the outstanding code is reused and only
+        the ticket rotates, so repeated attempts do not send repeated mail. Every
+        other account status is reported as invalid credentials.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: >-
+            Authentication succeeded. The body is AuthResponse for an active account
+            and VerificationChallenge for one pending email verification; the refresh
+            cookie is set only in the former case.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Rotating HTTP-only refresh credential. Absent for a pending account.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/AuthResponse"
+                  - $ref: "#/components/schemas/VerificationChallenge"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/InvalidCredentials"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/google:
+    post:
+      operationId: authenticateWithGoogle
+      summary: Sign in or create an account with a Google ID token
+      description: >-
+        Exchanges a Google-issued OpenID Connect ID token for a session. The server
+        verifies the signature, issuer, audience, and expiry, and requires Google's
+        own email_verified claim; the token's aud must match one of the OAuth client
+        IDs the deployment has configured.
+
+        This endpoint both signs in and registers. It resolves an account by the
+        token's subject first, because a Google account's address can change but its
+        subject cannot. With no existing link it falls back to the address: a local
+        account whose address is already verified — or one still pending, whose
+        verification Google's assertion completes — is linked and signed in, and an
+        address no account holds produces a new active, already-verified account.
+
+        An active account whose own address was never verified is refused with
+        account_link_required. Such accounts predate email verification, so nobody
+        ever proved the address belongs to whoever registered it, and linking would
+        hand the account to whoever now controls that address. The user signs in with
+        their password instead, which does prove it.
+
+        Unlike login, this never returns a verification challenge: Google has already
+        proved what the mailed code exists to prove. It is not gated by the
+        registration switch, which governs only the mailed-code flow; a deployment
+        disables this endpoint by configuring no audiences, which yields 503.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GoogleAuthRequest"
+      responses:
+        "200":
+          description: Authentication succeeded and a session was issued
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Rotating HTTP-only refresh credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/InvalidGoogleToken"
+        "409":
+          description: >-
+            The assertion cannot be linked. `account_link_required` when an account
+            holds this address but never verified it; `account_identity_conflict`
+            when that account is already linked to a different Google account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/verify-email:
+    post:
+      operationId: verifyEmail
+      summary: Activate a pending account with its verification code
+      description: >-
+        Exchanges a verification ticket and its six-digit code for a real session.
+        This is the only endpoint that activates an account. The ticket is not a
+        bearer credential: it authorizes nothing but this endpoint and
+        resend-verification.
+
+        The code expires after ten minutes and allows eight wrong attempts, after
+        which a new one must be requested. Wrong codes, expired codes, exhausted
+        challenges, and unknown tickets are all reported identically.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyEmailRequest"
+      responses:
+        "200":
+          description: Account activated and session started
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Rotating HTTP-only refresh credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/InvalidVerificationCode"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/resend-verification:
+    post:
+      operationId: resendVerification
+      summary: Send a new verification code
+      description: >-
+        Rotates both the ticket and the code behind an outstanding challenge and mails
+        the new code. Limited to one request every thirty seconds per challenge, and
+        three per ten minutes per address. An unknown ticket and a ticket whose
+        account is no longer pending are answered identically, so this endpoint
+        reports nothing about an account's state.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResendVerificationRequest"
+      responses:
+        "200":
+          description: A new code was sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerificationChallenge"
+        "400":
+          $ref: "#/components/responses/InvalidVerificationCode"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/refresh:
+    post:
+      operationId: refresh
+      summary: Rotate the browser refresh credential
+      security:
+        - refreshCookie: []
+        - developmentRefreshCookie: []
+      responses:
+        "200":
+          description: Credentials rotated
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: New rotating HTTP-only refresh credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          $ref: "#/components/responses/InvalidRefresh"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/auth/logout:
+    post:
+      operationId: logout
+      summary: Revoke the current authentication session
+      security:
+        - refreshCookie: []
+        - developmentRefreshCookie: []
+        - {}
+      responses:
+        "204":
+          description: Session revoked or already absent
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Clears the browser refresh credential.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/account:
+    get:
+      operationId: getCurrentAccount
+      summary: Return the account authorized by the access credential
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/connector-pairings/challenge:
+    post:
+      operationId: createConnectorPairingChallenge
+      summary: Create a short-lived connector proof-of-possession challenge
+      security: []
+      responses:
+        "201":
+          description: Challenge created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityChallenge"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/devices/challenge:
+    post:
+      operationId: createDevicePairingChallenge
+      summary: Create an account-bound browser device proof-of-possession challenge
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Challenge created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityChallenge"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connector-pairings:
+    post:
+      operationId: beginConnectorPairing
+      summary: Begin pairing for a connector that proves possession of its identity
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BeginPairingRequest"
+      responses:
+        "201":
+          description: Pairing authorization created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BeginPairingResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connector-pairings/claim:
+    post:
+      operationId: claimConnectorPairing
+      summary: Review a user code from a browser device that proves possession of its identity
+      description: >-
+        Every attempt spends its device challenge, so each guess needs a fresh signed
+        challenge. A code that matches no pairing returns 404 (never 401, which clients
+        treat as a lost session) and is counted: an account may try at most 10 incorrect
+        codes per hour, and the service at most 120 per minute across all accounts. Over
+        either budget the claim returns 429 with Retry-After before the code is checked,
+        so a refused claim reveals nothing about the code.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimPairingRequest"
+      responses:
+        "200":
+          description: Pairing transcript ready for independent safety-code comparison
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimPairingResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: The code matches no pairing (code `invalid_code`); the attempt was counted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          $ref: "#/components/responses/InvalidState"
+        "410":
+          $ref: "#/components/responses/Expired"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connector-pairings/{pairingId}/confirm:
+    post:
+      operationId: confirmConnectorPairing
+      summary: Confirm that the independently displayed safety codes match
+      description: >-
+        Succeeds only after the person at OpenCode has approved this device there
+        (approveConnectorPairing); until then it returns 409 and the client should ask
+        the user to approve in OpenCode and try again. A pairing rejected in OpenCode
+        returns 410. Each confirmation issues a fresh random device credential; a retry
+        of the same confirmation returns the same one, and a later pairing for the same
+        device never reissues an earlier one.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PairingId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfirmPairingRequest"
+      responses:
+        "200":
+          description: Trust established and persistent device and connector credentials installed
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Host-bound HTTP-only device credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfirmPairingResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/InvalidState"
+        "410":
+          $ref: "#/components/responses/Expired"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connector-pairings/{pairingId}/poll:
+    post:
+      operationId: pollConnectorPairing
+      summary: Poll pairing state and receive connector authorization after confirmation
+      security:
+        - pairingAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PairingId"
+      responses:
+        "200":
+          description: Current pairing state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PollPairingResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "410":
+          $ref: "#/components/responses/Expired"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connector-pairings/{pairingId}/approve:
+    post:
+      operationId: approveConnectorPairing
+      summary: Record the approval given in OpenCode after comparing the safety code
+      description: >-
+        Plugin-only; browser Origin and cross-site requests are rejected. Called once the
+        person at the OpenCode machine has compared the safety code and approved the device
+        that claimed the pairing. Confirmation requires it, so knowing the user code is not
+        enough to bind a connector to an account. The body names the device key the
+        connector was shown, and the approval applies only to that device (409 otherwise).
+        Repeating it succeeds without repeating the audit event. To reject, cancel the
+        pairing instead.
+      security:
+        - pairingAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PairingId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovePairingRequest"
+      responses:
+        "204":
+          description: Approval recorded, or already recorded
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/InvalidState"
+        "410":
+          $ref: "#/components/responses/Expired"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connector-pairings/{pairingId}/cancel:
+    post:
+      operationId: cancelConnectorPairing
+      summary: Cancel an incomplete pairing so the connector can issue a replacement code
+      security:
+        - pairingAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PairingId"
+      responses:
+        "204":
+          description: Pairing cancelled or already expired
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/InvalidState"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/self:
+    get:
+      operationId: getOwnConnector
+      summary: Read the authenticated connector's original linking date
+      description: >-
+        Plugin-only request authenticated by an active connector credential. Returns
+        only this connector's ID and its creation timestamp from the original pairing.
+        Browser Origin and cross-site requests are rejected. No target ID is accepted.
+      security:
+        - connectorAuth: []
+      responses:
+        "200":
+          description: Connector metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [connectorId, linkedAt]
+                properties:
+                  connectorId:
+                    type: string
+                  linkedAt:
+                    type: string
+                    format: date-time
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/{connectorID}/rename:
+    post:
+      operationId: renameAccountConnector
+      summary: Set the display name of an account-owned connector
+      description: >-
+        Updates the name shown to all clients of the authenticated account.
+        Names are trimmed and limited to 64 UTF-8 bytes after trimming.
+        Missing, revoked, and foreign connectors return 404. Names are excluded
+        from audit metadata; identity, credentials, and trust do not change.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: connectorID
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+      responses:
+        "200":
+          description: Persisted name
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connectorId, name]
+                properties:
+                  connectorId:
+                    type: string
+                  name:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Connection unavailable
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/{connectorID}/revoke:
+    post:
+      operationId: revokeAccountConnector
+      summary: Revoke a connector owned by the authenticated account
+      description: >-
+        Revokes remote access for all devices using this connector and hides it
+        from active inventory. OpenCode conversations are unaffected. Requires
+        account access authentication; device pairing is not required to revoke.
+        Missing and foreign IDs both return 404. Repeated owner requests return
+        204 without duplicating the audit event. New and unused relay tickets
+        fail immediately, and the connector's live relay sockets are closed as soon
+        as the revocation commits. Allowed browser origins and native clients
+        are supported. Connector-only credentials cannot use this operation.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: connectorID
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+      responses:
+        "204":
+          description: Connector revoked or already revoked
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Connection unavailable, including another account's connector
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/self/revoke:
+    post:
+      operationId: revokeOwnConnector
+      summary: Revoke the connector authenticated by its credential
+      description: >-
+        Plugin-only operation; browser Origin and cross-site requests are rejected.
+        No account or connector ID is accepted. Repeated requests with the same revoked
+        credential succeed without repeating the audit event. New tickets and unused
+        tickets are rejected immediately, and the connector's live relay sockets are
+        closed as soon as the revocation commits.
+      security:
+        - connectorAuth: []
+      responses:
+        "204":
+          description: Connector revoked, or already revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/devices/self/rotate:
+    post:
+      operationId: rotateOwnDeviceCredential
+      summary: Issue a replacement credential for the authenticated device
+      description: >-
+        Authenticated by the account access credential, the device ID, and the current device
+        cookie together; the device ID is never the sole authority. The returned credential
+        grants nothing until it is activated, and the current cookie keeps working until then,
+        so a client that never persists or never activates the replacement is not locked out.
+        A rotation that is not activated before activateBy lapses and leaves the current
+        credential in place, as does any request authenticated with the current credential.
+        The replacement is returned in the body rather than as a cookie, because setting it as
+        one would replace the credential the caller still needs.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceCredentialRotationRequest"
+      responses:
+        "201":
+          description: Replacement credential issued, pending activation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorCredentialRotationResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/devices/self/rotate/activate:
+    post:
+      operationId: activateOwnDeviceCredential
+      summary: Commit a pending device credential rotation
+      description: >-
+        Authenticated by the pending credential rather than the current one, sent as the device
+        cookie. Committing retires the previous credential, starts the renewed lifetime, and
+        returns the new value as a Set-Cookie with the same host-bound attributes as the
+        original, so callers must make it durable before activating. Activating a credential
+        that is already current is idempotent. A lapsed, cancelled or unknown credential is
+        rejected as unauthorized.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceCredentialRotationRequest"
+      responses:
+        "200":
+          description: Rotation committed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorCredentialActivationResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/self/rotate:
+    post:
+      operationId: rotateOwnConnectorCredential
+      summary: Issue a replacement credential for the authenticated connector
+      description: >-
+        Plugin-only operation; browser Origin and cross-site requests are rejected.
+        The returned credential grants nothing until it is activated, and the current
+        credential keeps working until then, so a caller that never persists or never
+        activates the replacement is not locked out. A rotation that is not activated
+        before activateBy lapses and leaves the current credential in place, as does any
+        request authenticated with the current credential. Rotating again replaces an
+        unactivated rotation. Rotation is not revocation and does not close a live relay
+        connection.
+      security:
+        - connectorAuth: []
+      responses:
+        "201":
+          description: Replacement credential issued, pending activation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorCredentialRotationResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/self/rotate/activate:
+    post:
+      operationId: activateOwnConnectorCredential
+      summary: Commit a pending credential rotation
+      description: >-
+        Plugin-only operation, authenticated by the pending credential rather than the
+        current one. Committing retires the previous credential and starts the renewed
+        lifetime, so callers must make the new credential durable first. Activating a
+        credential that is already current is idempotent and repeats neither the audit
+        event nor the expiry change, so a retry after a lost response is safe. A lapsed,
+        cancelled, or unknown credential is rejected as unauthorized.
+      security:
+        - connectorAuth: []
+      responses:
+        "200":
+          description: Rotation committed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorCredentialActivationResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors:
+    get:
+      operationId: listConnectors
+      summary: List active connectors owned by the account
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Connector inventory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/devices:
+    get:
+      operationId: listDevices
+      summary: List active client devices owned by the account
+      description: >-
+        Activated, unrevoked devices only. Credentials and credential hashes are never
+        returned.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Device inventory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/devices/{deviceID}/revoke:
+    post:
+      operationId: revokeAccountDevice
+      summary: Revoke a client device owned by the authenticated account
+      description: >-
+        Removes a device, typically a lost or replaced phone, from any session on the
+        account. Only account access authentication is required; the device's own
+        credential is not, since a lost device cannot present it. The device credential,
+        any pending credential rotation, and every trust relationship the device holds
+        end together, and connectors stop receiving its identity at their next relay
+        admission. New and unused relay tickets fail immediately, and the device's live
+        relay sockets are closed as soon as the revocation commits. A revoked device
+        cannot be paired again; the installation must generate a new identity. Missing
+        and foreign IDs both return 404. Repeated owner requests return 204 without
+        duplicating the audit event.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: deviceID
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+      responses:
+        "204":
+          description: Device revoked or already revoked
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Device unavailable, including another account's device
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/relay/tickets:
+    post:
+      operationId: createRelayTicket
+      summary: Issue a short-lived single-use WebSocket admission ticket
+      description: Browser callers send an account access credential plus a host-bound device cookie and device ID. Connectors send their connector credential and an empty object.
+      security:
+        - bearerAuth: []
+          deviceCookie: []
+        - connectorAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelayTicketRequest"
+      responses:
+        "201":
+          description: Relay ticket created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelayTicketResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+components:
+  parameters:
+    PairingId:
+      name: pairingId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^par_[A-Za-z0-9_-]{24}$"
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-opencode_remote_refresh
+    developmentRefreshCookie:
+      type: apiKey
+      in: cookie
+      name: opencode_remote_refresh
+      description: Loopback HTTP development only.
+    pairingAuth:
+      type: http
+      scheme: Pairing
+      bearerFormat: pairing-secret
+    connectorAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-connector-credential
+    deviceCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-opencode_remote_device
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, clientName]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+          writeOnly: true
+        clientName:
+          type: string
+          minLength: 1
+          maxLength: 64
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, clientName]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          writeOnly: true
+        clientName:
+          type: string
+          minLength: 1
+          maxLength: 64
+    GoogleAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [idToken, clientName]
+      properties:
+        idToken:
+          type: string
+          description: >-
+            A Google-issued OpenID Connect ID token, as returned by the native Google
+            Sign-In SDK. It is a credential: send it only over TLS, and never log it.
+          minLength: 1
+          maxLength: 4096
+          writeOnly: true
+        clientName:
+          type: string
+          minLength: 1
+          maxLength: 64
+    VerifyEmailRequest:
+      type: object
+      additionalProperties: false
+      required: [verificationTicket, code]
+      properties:
+        verificationTicket:
+          type: string
+          pattern: "^vft_[A-Za-z0-9_-]{43}$"
+          writeOnly: true
+        code:
+          type: string
+          pattern: "^[0-9]{6}$"
+          writeOnly: true
+    ResendVerificationRequest:
+      type: object
+      additionalProperties: false
+      required: [verificationTicket]
+      properties:
+        verificationTicket:
+          type: string
+          pattern: "^vft_[A-Za-z0-9_-]{43}$"
+          writeOnly: true
+    VerificationChallenge:
+      type: object
+      additionalProperties: false
+      required: [user, verificationTicket, verificationTicketExpiresAt]
+      description: >-
+        A pending account and the ticket that lets it prove ownership of its address.
+        The ticket is scoped to verify-email and resend-verification only; it is not a
+        bearer credential and grants no access to any other endpoint. No access token
+        accompanies it, because no session exists yet.
+      properties:
+        user:
+          $ref: "#/components/schemas/Account"
+        verificationTicket:
+          type: string
+          pattern: "^vft_[A-Za-z0-9_-]{43}$"
+        verificationTicketExpiresAt:
+          type: string
+          format: date-time
+    AuthResponse:
+      type: object
+      additionalProperties: false
+      required: [accessToken, accessTokenExpiresAt, user]
+      properties:
+        accessToken:
+          type: string
+        accessTokenExpiresAt:
+          type: string
+          format: date-time
+        user:
+          $ref: "#/components/schemas/Account"
+    AccountResponse:
+      type: object
+      additionalProperties: false
+      required: [user]
+      properties:
+        user:
+          $ref: "#/components/schemas/Account"
+    Account:
+      type: object
+      additionalProperties: false
+      required: [id, email, status, emailVerified, emailBounced, createdAt]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+        status:
+          type: string
+          description: >-
+            Only this field is authoritative for access. Accounts created before email
+            verification existed are active with emailVerified false, and clients must
+            never gate access on emailVerified.
+          enum: [pending, active, disabled]
+        emailVerified:
+          type: boolean
+        emailBounced:
+          type: boolean
+          description: >-
+            Diagnostic only: the last delivery to this address failed permanently.
+            It never blocks anything, including resending a code, and no authorization
+            decision consults it. Always false on a verification challenge.
+        createdAt:
+          type: string
+          format: date-time
+    PublicIdentity:
+      type: object
+      additionalProperties: false
+      required: [version, suite, keyId, publicKey]
+      properties:
+        version:
+          type: integer
+          const: 1
+        suite:
+          type: string
+          const: HPKE-Auth-P256-HKDF-SHA256-AES-256-GCM
+        keyId:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+        publicKey:
+          type: string
+          pattern: "^[A-Za-z0-9_-]+$"
+          maxLength: 1024
+    IdentityProof:
+      type: object
+      additionalProperties: false
+      required: [challenge, signature]
+      description: Raw 64-byte P-256 ECDSA/SHA-256 signature over the versioned canonical identity challenge transcript.
+      properties:
+        challenge:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+        signature:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{86}$"
+    IdentityChallenge:
+      type: object
+      additionalProperties: false
+      required: [challenge, expiresAt]
+      properties:
+        challenge:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+          writeOnly: true
+        expiresAt:
+          type: string
+          format: date-time
+    BeginPairingRequest:
+      type: object
+      additionalProperties: false
+      required: [name, identity, proof]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        identity:
+          $ref: "#/components/schemas/PublicIdentity"
+        proof:
+          $ref: "#/components/schemas/IdentityProof"
+    BeginPairingResponse:
+      type: object
+      additionalProperties: false
+      required: [pairingId, pairingSecret, userCode, serviceId, verificationUri, expiresAt, pollIntervalSeconds]
+      properties:
+        pairingId:
+          type: string
+        pairingSecret:
+          type: string
+          writeOnly: true
+        userCode:
+          type: string
+          pattern: "^[0-9A-HJ-KM-NP-TV-Z]{4}-[0-9A-HJ-KM-NP-TV-Z]{4}$"
+        serviceId:
+          type: string
+        verificationUri:
+          type: string
+          format: uri
+        expiresAt:
+          type: string
+          format: date-time
+        pollIntervalSeconds:
+          type: integer
+          minimum: 1
+          maximum: 30
+    PairingTranscript:
+      type: object
+      additionalProperties: false
+      required: [version, serviceId, pairingId, connectorIdentity, deviceIdentity]
+      description: Both clients hash this canonical, role-ordered transcript and display the first 96 bits as six hexadecimal groups.
+      properties:
+        version:
+          type: integer
+          const: 1
+        serviceId:
+          type: string
+        pairingId:
+          type: string
+        connectorIdentity:
+          $ref: "#/components/schemas/PublicIdentity"
+        deviceIdentity:
+          $ref: "#/components/schemas/PublicIdentity"
+    ClaimPairingRequest:
+      type: object
+      additionalProperties: false
+      required: [userCode, deviceName, identity, proof]
+      properties:
+        userCode:
+          type: string
+        deviceName:
+          type: string
+          minLength: 1
+          maxLength: 64
+        identity:
+          $ref: "#/components/schemas/PublicIdentity"
+        proof:
+          $ref: "#/components/schemas/IdentityProof"
+    ClaimPairingResponse:
+      type: object
+      additionalProperties: false
+      required: [pairingId, deviceId, expiresAt, transcript]
+      properties:
+        pairingId:
+          type: string
+        deviceId:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        transcript:
+          $ref: "#/components/schemas/PairingTranscript"
+    ConfirmPairingRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+    ConfirmPairingResponse:
+      type: object
+      additionalProperties: false
+      required: [deviceId, connectorId]
+      properties:
+        deviceId:
+          type: string
+        connectorId:
+          type: string
+    PollPairingResponse:
+      type: object
+      additionalProperties: false
+      required: [status, pairingId, serviceId, expiresAt]
+      properties:
+        status:
+          type: string
+          enum: [pending, verification, confirmed, completed, expired]
+        pairingId:
+          type: string
+        serviceId:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        transcript:
+          $ref: "#/components/schemas/PairingTranscript"
+        connectorId:
+          type: string
+        connectorCredential:
+          type: string
+          writeOnly: true
+        connectorCredentialExpiresAt:
+          type: string
+          format: date-time
+        linkedAt:
+          type: string
+          format: date-time
+          description: Original connector creation time during pairing; included when pairing is completed.
+    Connector:
+      type: object
+      additionalProperties: false
+      required: [id, name, identity, createdAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        identity:
+          $ref: "#/components/schemas/PublicIdentity"
+        createdAt:
+          type: string
+          format: date-time
+    ConnectorListResponse:
+      type: object
+      additionalProperties: false
+      required: [connectors]
+      properties:
+        connectors:
+          type: array
+          items:
+            $ref: "#/components/schemas/Connector"
+    Device:
+      type: object
+      additionalProperties: false
+      required: [id, name, identity, createdAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        identity:
+          $ref: "#/components/schemas/PublicIdentity"
+        createdAt:
+          type: string
+          format: date-time
+    DeviceListResponse:
+      type: object
+      additionalProperties: false
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/Device"
+    ApprovePairingRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceKeyId]
+      properties:
+        deviceKeyId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Key ID of the device in the transcript the connector showed and the user approved.
+    DeviceCredentialRotationRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+          description: The device being rotated. Checked against the device the cookie authenticates.
+    ConnectorCredentialRotationResponse:
+      type: object
+      additionalProperties: false
+      required: [credential, activateBy]
+      properties:
+        credential:
+          type: string
+          description: >-
+            The replacement credential. It authorizes nothing until it is activated, so it
+            must be stored durably alongside the current credential before activation.
+        activateBy:
+          type: string
+          format: date-time
+          description: After this instant the rotation lapses and the current credential remains in force.
+    ConnectorCredentialActivationResponse:
+      type: object
+      additionalProperties: false
+      required: [credentialExpiresAt]
+      properties:
+        credentialExpiresAt:
+          type: string
+          format: date-time
+          description: Expiry of the newly committed credential, measured from activation.
+    RelayTicketRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        deviceId:
+          type: string
+          description: Required for browser callers and omitted by connectors.
+    RelayTicketResponse:
+      type: object
+      additionalProperties: false
+      required: [ticket, expiresAt, webSocketUrl]
+      properties:
+        ticket:
+          type: string
+          writeOnly: true
+        expiresAt:
+          type: string
+          format: date-time
+        webSocketUrl:
+          type: string
+          description: Relative WebSocket path. The ticket is sent in the WebSocket subprotocol header, never this URL.
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InvalidCredentials:
+      description: Email or password is invalid
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InvalidGoogleToken:
+      description: >-
+        The Google ID token could not be verified. Malformed, expired, wrong
+        audience, wrong issuer, bad signature, and an address Google has not itself
+        verified are deliberately indistinguishable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InvalidVerificationCode:
+      description: >-
+        The verification code or ticket is invalid, expired, or out of attempts.
+        These cases are deliberately indistinguishable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InvalidRefresh:
+      description: Refresh credential is invalid or expired
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Access credential is invalid or expired
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: The request body is not JSON
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body exceeds the configured limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Browser origin is not allowed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: The requested operation is not enabled
+      content:
+        application/json:
+            schema:
+              $ref: "#/components/schemas/Error"
+    InvalidState:
+      description: Pairing state does not allow the requested transition
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Expired:
+      description: Pairing authorization expired
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
